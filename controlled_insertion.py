@@ -44,10 +44,6 @@ INSTALL
 -------
 pip install -U datasets transformers
 
-RUN
----
-python controlled_insertion_final.py
-
 OUTPUT
 ------
 modified_dataset.json:
@@ -56,13 +52,6 @@ modified_dataset.json:
 insertion_metadata.json:
     Target descriptions, insertion positions, frequencies,
     and experimental configuration.
-
-LIMITATIONS
------------
-- Contextual topic-based host selection is not implemented.
-- Dataset editing does not control training-time shuffling.
-- Target insertions may change tokenization near boundaries.
-- All selected documents are held in memory.
 """
 
 import hashlib
