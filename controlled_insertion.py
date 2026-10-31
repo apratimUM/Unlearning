@@ -7,82 +7,68 @@ CONTROLLED SPAN INSERTION INTO THE PILE DATASET
 
 PROJECT OBJECTIVE
 -----------------
+Investigate how insertion frequency, dataset position, and
+within-document position influence language model memorization.
 
-HOW THE FRAMEWORK WORKS
------------------------
+This script modifies the dataset only. It does not train models.
+
+WORKFLOW
+--------
 1. Load selected documents from the original Pile dataset.
-2. Obtain the target text span(s).
-3. Select which existing Pile documents receive each target.
-4. Determine the insertion position inside each document.
-5. Insert the target without deleting original document text.
-6. Validate that the insertion was performed correctly.
+2. Obtain one or more target text spans.
+3. Select existing Pile documents to receive each target.
+4. Determine the insertion position within each document.
+5. Insert target text without deleting original document text.
+6. Validate insertion positions, frequency, and text preservation.
 7. Save the modified dataset and detailed insertion metadata.
-
-
-EXAMPLE
--------
-Suppose we load 100 Pile documents and want to insert:
-
-    "my name is apratim"
-
-into documents with original source IDs 2, 5, and 10.
-
-We can independently specify:
-
-    Document 2  -> insert at 10% of its original length
-    Document 5  -> insert at character offset 30
-    Document 10 -> insert at the end
-
-All other documents remain unchanged.
-
-The original order of Pile documents is preserved.
-
 
 IMPORTANT DEFINITIONS
 ---------------------
 Source ID:
-    Zero-based row index in the original Hugging Face
-    Pile dataset stream.
+    Zero-based row index in the original Pile dataset stream.
 
 Output document index:
-    Zero-based index within the subset loaded by this script.
+    Zero-based position within the loaded experimental subset.
 
 Frequency:
-    Number of DISTINCT host documents receiving one insertion
-    of a particular target span.
+    Number of distinct host documents receiving a target.
+    Each target is inserted at most once per selected host.
 
 Character offset:
-    Position between characters of the ORIGINAL document.
-    Offset 0 means before the first character.
+    Insertion position in the ORIGINAL document.
 
 Token offset:
-    Insertion boundary derived from the tokenizer's offset
-    mapping on the ORIGINAL document.
-
-    The modified text may tokenize differently afterward.
+    Character position derived from token boundaries in the
+    ORIGINAL document. Retokenization may change boundaries.
 
 Dataset position:
-    Position in the loaded, unshuffled dataset sequence.
-    It does not directly control optimizer update steps.
+    Position within the loaded, unshuffled document sequence.
+    Actual training exposure depends on the downstream trainer.
 
-
-DEPENDENCIES
-------------
+INSTALL
+-------
 pip install -U datasets transformers
 
 RUN
 ---
 python controlled_insertion_final.py
 
-OUTPUTS
--------
-1. modified_dataset.json
-   Complete selected dataset, including modified and
-   unmodified Pile documents.
+OUTPUT
+------
+modified_dataset.json:
+    Complete selected dataset, including unmodified documents.
 
-2. insertion_metadata.json
-   Experimental configuration, target spans, positions,
-   frequencies, and insertion records.
+insertion_metadata.json:
+    Target descriptions, insertion positions, frequencies,
+    and experimental configuration.
+
+LIMITATIONS
+-----------
+- Contextual topic-based host selection is not implemented.
+- Dataset editing does not control training-time shuffling.
+- Target insertions may change tokenization near boundaries.
+- All selected documents are held in memory.
+"""
 
 import hashlib
 import json
@@ -96,6 +82,17 @@ from collections import defaultdict
 # ============================================================
 # 1. EXPERIMENT CONFIGURATION
 # ============================================================
+#
+# Researchers should normally modify only this section.
+#
+# The configuration separates:
+#   1. Base dataset selection
+#   2. Randomness and tokenizer settings
+#   3. Output directory
+#   4. Target spans
+#   5. Insertion frequency and document selection
+#   6. Within-document insertion positions
+# ============================================================
 
 CONFIG = {
 
@@ -103,70 +100,43 @@ CONFIG = {
     # A. BASE DATASET
     # --------------------------------------------------------
     #
-    # The original dataset into which target spans are inserted.
-    #
-    # IMPORTANT:
-    # We modify the TEXT of existing documents.
-    # We do not create additional Pile documents.
-    #
-    # Consequently, the number of output documents is equal
-    # to the number of loaded host documents.
+    # We insert target text into existing Pile documents.
+    # No additional Pile documents are created.
     # --------------------------------------------------------
 
     "dataset": "EleutherAI/the_pile_deduplicated",
 
-    # Optional Hugging Face dataset configuration.
-    # Keep None when no named configuration is required.
+    # Optional named Hugging Face dataset configuration.
     "dataset_config": None,
 
-    # Optional dataset commit/revision.
-    #
-    # Pinning a revision improves experiment reproducibility
-    # because the underlying dataset could change over time.
+    # Optional fixed revision for reproducibility.
     "dataset_revision": None,
 
     "split": "train",
 
 
     # --------------------------------------------------------
-    # B. SELECT WHICH PILE DOCUMENTS TO LOAD
+    # B. SELECT ORIGINAL PILE DOCUMENTS TO LOAD
     # --------------------------------------------------------
     #
-    # This setting determines the experimental dataset subset.
+    # This determines the experimental document pool.
     #
-    # It is NOT the same as choosing which documents receive
-    # target insertions.
+    # OPTION 1: Load first N documents
     #
-    # First we load the host-document pool.
-    # Later, each target selects recipients from that pool.
+    # {"mode": "first_n", "n": 100}
     #
-    # Supported modes:
+    # OPTION 2: Load specific original source IDs
     #
-    # 1. First N documents:
+    # {"mode": "source_ids", "ids": [0, 2, 5, 10]}
     #
-    #    {"mode": "first_n", "n": 100}
+    # OPTION 3: Load a source ID range
     #
-    #    Loads source IDs 0 through 99.
+    # {"mode": "source_range", "start": 100, "stop": 300}
     #
-    # 2. Specific original source IDs:
+    # The stop index is exclusive.
     #
-    #    {"mode": "source_ids", "ids": [0, 2, 5, 10]}
-    #
-    #    Loads only these documents.
-    #    Output order remains 0, 2, 5, 10.
-    #
-    # 3. Source ID range:
-    #
-    #    {"mode": "source_range",
-    #     "start": 100,
-    #     "stop": 300}
-    #
-    #    Loads source IDs 100 through 299.
-    #    The stop index is exclusive.
-    #
-    # Note:
-    # Source IDs refer to original stream indices, not
-    # the positions of documents after selection.
+    # Loading documents does not necessarily mean
+    # inserting target text into all of them.
     # --------------------------------------------------------
 
     "take": {
@@ -179,34 +149,19 @@ CONFIG = {
     # C. RANDOM SEED
     # --------------------------------------------------------
     #
-    # Ensures that random host selection and random insertion
-    # positions are reproducible with the same inputs.
-    #
-    # The seed does NOT shuffle the dataset.
-    #
-    # A local random-number generator is created rather than
-    # changing Python's global random state.
+    # Controls random host selection and random placement.
+    # Does not shuffle the dataset.
     # --------------------------------------------------------
 
     "seed": 42,
 
 
     # --------------------------------------------------------
-    # D. TOKENIZER CONFIGURATION
+    # D. TOKENIZER
     # --------------------------------------------------------
     #
-    # Required only for token-based placement modes:
-    #
-    #   token_offset
-    #   random_token
-    #   token_percentage
-    #
-    # The tokenizer is loaded lazily, meaning it is not
-    # downloaded or initialized unless token-based placement
-    # is actually requested.
-    #
-    # A FAST tokenizer is required because we need character
-    # offset mappings for original text tokens.
+    # Used only when token-based placement is requested.
+    # Must support fast-tokenizer offset mappings.
     # --------------------------------------------------------
 
     "tokenizer": "gpt2",
@@ -214,13 +169,11 @@ CONFIG = {
 
 
     # --------------------------------------------------------
-    # E. EXPERIMENT OUTPUT DIRECTORY
+    # E. OUTPUT DIRECTORY
     # --------------------------------------------------------
     #
-    # Use a different directory for each experiment.
-    #
-    # Existing directories are intentionally rejected to
-    # avoid accidentally overwriting previous results.
+    # Existing experiment directories are not overwritten.
+    # Change this for every new experiment.
     # --------------------------------------------------------
 
     "output_dir": "pile_final_run_1",
@@ -230,37 +183,36 @@ CONFIG = {
     # F. TARGET SPANS
     # --------------------------------------------------------
     #
-    # Each dictionary describes ONE independently controlled
-    # target text span.
+    # Each target is configured independently.
     #
-    # Multiple targets are supported.
+    # Different targets may have different:
+    #   - Text sources
+    #   - Frequencies
+    #   - Host documents
+    #   - Insertion positions
     #
-    # Example:
-    #   target_1 -> appears in 3 documents
-    #   target_2 -> appears in 10 documents
-    #
-    # Different targets may also appear in the same document.
+    # Multiple different targets may share a host document.
     # --------------------------------------------------------
 
     "targets": [
 
         {
-            # Unique identifier used in the metadata.
+            # Unique target identifier.
             "id": "target_1",
 
 
             # ------------------------------------------------
-            # F1. TARGET SPAN SOURCE
+            # F1. TARGET TEXT SOURCE
             # ------------------------------------------------
             #
-            # OPTION A: Directly specified text.
+            # OPTION A: Literal text
             #
-            # This is useful for a controlled canary,
-            # fictional statement, or other predefined span.
+            # "source": {
+            #     "mode": "literal",
+            #     "text": "my name is apratim"
+            # }
             #
-            # OPTION B: Extract text from another HF dataset.
-            #
-            # Example:
+            # OPTION B: Text from another Hugging Face dataset
             #
             # "source": {
             #     "mode": "hf",
@@ -274,15 +226,14 @@ CONFIG = {
             #     "slice_end": 150
             # }
             #
-            # Here:
-            #   index = external dataset row
-            #   field = column containing the text
+            # For HF mode:
+            #   index       = external dataset row
+            #   field       = field containing text
             #   slice_start = first selected character
-            #   slice_end = exclusive ending character
+            #   slice_end   = exclusive ending character
             #
-            # Only the extracted span is inserted into Pile.
-            # The external document itself is not added
-            # as a separate training record.
+            # Only the extracted span is inserted.
+            # The external document is not added separately.
             # ------------------------------------------------
 
             "source": {
@@ -292,37 +243,28 @@ CONFIG = {
 
 
             # ------------------------------------------------
-            # F2. INSERTION FREQUENCY AND DATASET POSITION
+            # F2. FREQUENCY AND HOST-DOCUMENT SELECTION
             # ------------------------------------------------
-            #
-            # This configuration chooses WHICH Pile documents
-            # receive the target text.
-            #
-            # Experimental frequency is the number of distinct
-            # host documents receiving this target.
-            #
-            # Supported selection modes:
             #
             # OPTION A: Explicit source IDs
             #
-            # {"mode": "explicit",
-            #  "source_ids": [2, 5, 10]}
+            # {"mode": "explicit", "source_ids": [2, 5, 10]}
             #
-            # Frequency is 3.
+            # Frequency = 3 distinct documents.
             #
-            # OPTION B: Randomly selected hosts
+            # OPTION B: Random hosts
             #
             # {"mode": "random",
             #  "frequency": 10,
             #  "stage": "all"}
             #
-            # Stage can be:
-            #   all    -> entire loaded dataset
-            #   early  -> first third
-            #   middle -> middle third
-            #   late   -> final third
+            # Available stages:
+            #   all
+            #   early
+            #   middle
+            #   late
             #
-            # OPTION C: Custom fractional dataset region
+            # OPTION C: Random hosts in a custom region
             #
             # {"mode": "random",
             #  "frequency": 10,
@@ -330,32 +272,20 @@ CONFIG = {
             #  "start_fraction": 0.20,
             #  "end_fraction": 0.80}
             #
-            # Select 10 random documents from the region
-            # spanning 20% to 80% of the loaded dataset.
-            #
-            # OPTION D: Every Nth eligible document
+            # OPTION D: Every Nth document
             #
             # {"mode": "every_n",
             #  "frequency": 10,
             #  "every_n": 5,
             #  "start_output_index": 0}
             #
-            # Select from indices:
-            #   0, 5, 10, 15, ...
-            #
-            # The first 10 eligible candidates are selected.
-            #
-            # OPTION E: Random selection within index range
+            # OPTION E: Random hosts from a fixed range
             #
             # {"mode": "range",
             #  "frequency": 10,
             #  "start_output_index": 20,
             #  "stop_output_index": 80}
             #
-            # Select 10 distinct documents randomly from
-            # output indices 20 through 79.
-            #
-            # IMPORTANT:
             # Explicit selection uses ORIGINAL source IDs.
             # Range/every_n use LOADED output indices.
             # ------------------------------------------------
@@ -367,42 +297,29 @@ CONFIG = {
 
 
             # ------------------------------------------------
-            # F3. DEFAULT POSITION INSIDE EACH DOCUMENT
+            # F3. DEFAULT WITHIN-DOCUMENT POSITION
             # ------------------------------------------------
-            #
-            # Controls WHERE the target appears in a selected
-            # host document.
-            #
-            # All offsets are calculated using original text.
-            #
-            # Supported modes:
             #
             # {"mode": "beginning"}
             # {"mode": "middle"}
             # {"mode": "end"}
             #
             # {"mode": "percentage", "value": 0.37}
-            #   Insert around 37% of the character length.
             #
             # {"mode": "character_offset", "value": 50}
-            #   Insert after the first 50 characters.
             #
             # {"mode": "random_character"}
-            #   Random character boundary, including ends.
             #
             # {"mode": "token_offset", "value": 25}
-            #   Insert at tokenizer-derived boundary 25.
             #
             # {"mode": "random_token"}
-            #   Random valid token boundary.
             #
             # {"mode": "token_percentage", "value": 0.50}
-            #   Insert around 50% of original token count.
             #
-            # Percentages range from 0.0 through 1.0.
+            # Percentages must be between 0 and 1.
             #
-            # This default is applied unless a per-document
-            # override is specified below.
+            # Every position is resolved against the ORIGINAL
+            # host text, not text modified by other insertions.
             # ------------------------------------------------
 
             "position": {
@@ -415,27 +332,17 @@ CONFIG = {
             # F4. DOCUMENT-SPECIFIC POSITION OVERRIDES
             # ------------------------------------------------
             #
-            # Different selected documents can receive
-            # the same target at different positions.
+            # Keys are ORIGINAL Pile source IDs as strings.
             #
-            # Dictionary keys are original Pile source IDs
-            # written as strings.
+            # These override the default position above.
             #
-            # These settings OVERRIDE the default position.
+            # Example:
+            #   Document 2  -> 10% of character length
+            #   Document 5  -> character offset 30
+            #   Document 10 -> end of document
             #
-            # In this example:
-            #
-            # Document 2:
-            #   Insert at 10% of original character length.
-            #
-            # Document 5:
-            #   Insert at character offset 30.
-            #
-            # Document 10:
-            #   Insert at the end.
-            #
-            # The feature is useful when studying effects
-            # of positional diversity on memorization.
+            # This enables positional diversity while keeping
+            # the same target text and insertion frequency.
             # ------------------------------------------------
 
             "per_document_positions": {
@@ -454,56 +361,23 @@ CONFIG = {
                     "mode": "end"
                 }
             }
-
         }
 
-        # Add additional target dictionaries here.
-        #
-        # Each target needs a unique ID.
-        # Different targets can use different frequencies,
-        # host selections, and insertion positions.
+        # Add more target dictionaries here, separated by commas.
     ]
 }
 
 
 # ============================================================
-# 2. BASIC VALIDATION UTILITIES
-# ============================================================
-#
-# These helpers validate configuration values before they
-# affect document selection or insertion.
-#
-# Early validation helps prevent invalid experiments
-# from silently producing incorrect datasets.
+# 2. VALIDATION HELPERS
 # ============================================================
 
 def integer(value, name, minimum=0):
     """
-    Validate an integer-valued configuration parameter.
+    Require an integer greater than or equal to minimum.
 
-    Parameters
-    ----------
-    value:
-        Input value to validate.
-
-    name:
-        Parameter name shown in error messages.
-
-    minimum:
-        Smallest permitted integer value.
-
-    Returns
-    -------
-    int:
-        The validated integer.
-
-    Notes
-    -----
-    Python considers bool a subclass of int.
-
-    We deliberately reject True and False because boolean
-    values should not be accepted as document counts,
-    source IDs, or character offsets.
+    Boolean values are rejected even though bool is a
+    subclass of int in Python.
     """
 
     if type(value) is not int or value < minimum:
@@ -517,19 +391,7 @@ def integer(value, name, minimum=0):
 
 def fraction(value, name):
     """
-    Validate a fractional position between 0 and 1.
-
-    Fractions are used for:
-        - Within-document percentage positions
-        - Token-percentage positions
-        - Custom dataset-region boundaries
-
-    For example:
-        0.0 -> beginning
-        0.5 -> midpoint
-        1.0 -> end
-
-    Returns the value as a float.
+    Validate a numeric fraction in the inclusive range [0, 1].
     """
 
     if (
@@ -545,17 +407,10 @@ def fraction(value, name):
 
 def sha(text):
     """
-    Compute the SHA-256 checksum of UTF-8 encoded text.
+    Return the SHA-256 checksum of UTF-8 encoded text.
 
-    Why store checksums?
-    --------------------
-    They provide stable fingerprints of original and
-    modified document contents.
-
-    These fingerprints can later help researchers verify
-    which exact text was used in an experiment.
-
-    This function does not encrypt the text.
+    Checksums help identify the exact original and modified
+    document contents used in an experiment.
     """
 
     return hashlib.sha256(
@@ -564,7 +419,7 @@ def sha(text):
 
 
 # ============================================================
-# 3. STREAM A HUGGING FACE DATASET
+# 3. STREAM HUGGING FACE DATASETS
 # ============================================================
 
 def hf_iterator(
@@ -574,43 +429,11 @@ def hf_iterator(
     revision=None
 ):
     """
-    Create a streaming iterator over a Hugging Face dataset.
+    Create a streaming iterator for a Hugging Face dataset.
 
-    Why streaming?
-    --------------
-    The Pile is very large.
+    Streaming avoids loading the entire Pile into memory.
 
-    Loading the complete dataset into memory would be
-    unnecessary when an experiment only needs a subset.
-
-    Streaming allows us to access rows sequentially
-    without downloading the complete dataset first.
-
-    Parameters
-    ----------
-    dataset:
-        Hugging Face dataset identifier.
-
-    split:
-        Dataset split to read.
-
-    config:
-        Optional named dataset configuration.
-
-    revision:
-        Optional dataset commit/revision for reproducibility.
-
-    Returns
-    -------
-    iterator:
-        Sequential iterator over dataset rows.
-
-    Important
-    ---------
-    Streaming preserves source order unless the underlying
-    dataset itself uses a different ordering.
-
-    This function never explicitly shuffles records.
+    Rows are read sequentially without explicit shuffling.
     """
 
     from datasets import load_dataset
@@ -631,50 +454,33 @@ def hf_iterator(
 
 
 # ============================================================
-# 4. LOAD ORIGINAL PILE HOST DOCUMENTS
+# 4. LOAD SELECTED ORIGINAL PILE DOCUMENTS
 # ============================================================
 
 def load_hosts(cfg):
     """
-    Load the subset of original Pile documents requested
-    by CONFIG["take"].
+    Load the original Pile documents specified by cfg["take"].
 
-    A host document is an existing Pile document that may
-    receive one or more target text insertions.
+    Returns a list of:
+        {
+            "source_id": original Pile row index,
+            "original_text": original document content
+        }
 
-    This function only loads documents. It does not yet
-    decide which ones will be modified.
-
-    Each returned host contains:
-        source_id
-        original_text
-
-    The source_id is preserved so results can be traced
-    back to the original dataset stream.
-
-    Returns
-    -------
-    list[dict]:
-        Selected host documents in original source order.
+    Source ordering is preserved.
     """
 
     take = cfg["take"]
     mode = take["mode"]
 
-    # --------------------------------------------------------
-    # Determine which original source IDs must be loaded.
-    # --------------------------------------------------------
-
+    # Determine which original source IDs must be retained.
     if mode == "first_n":
 
-        # Example: n=100 -> source IDs 0 through 99.
         n = integer(take["n"], "take.n", 1)
-
         requested = set(range(n))
 
     elif mode == "source_ids":
 
-        # Load only the explicitly requested source IDs.
         values = take["ids"]
 
         requested = {
@@ -682,7 +488,6 @@ def load_hosts(cfg):
             for i in values
         }
 
-        # Duplicate IDs are rejected to avoid ambiguity.
         if not values or len(requested) != len(values):
             raise ValueError(
                 "take.ids must contain distinct source IDs"
@@ -690,7 +495,6 @@ def load_hosts(cfg):
 
     elif mode == "source_range":
 
-        # Source range uses an exclusive stop index.
         start = integer(take["start"], "take.start")
 
         stop = integer(
@@ -706,7 +510,6 @@ def load_hosts(cfg):
             f"Unknown take mode: {mode}"
         )
 
-    # Create a streaming iterator over the base dataset.
     rows = hf_iterator(
         cfg["dataset"],
         cfg.get("split", "train"),
@@ -716,15 +519,12 @@ def load_hosts(cfg):
 
     hosts = []
 
-    # We only need to stream up to the largest requested ID.
+    # Only stream through the largest requested source ID.
     #
     # Example:
-    # Requested source IDs = {2, 5, 10}
+    # Requested IDs = {2, 5, 10}
     #
-    # We must read through index 10, but we only retain
-    # rows 2, 5, and 10.
-    #
-    # Streaming still requires visiting preceding rows.
+    # Read rows 0 through 10, retaining only 2, 5, and 10.
     for idx, row in enumerate(
         islice(rows, max(requested) + 1)
     ):
@@ -744,10 +544,7 @@ def load_hosts(cfg):
             "original_text": text
         })
 
-    # Ensure every requested document was available.
-    #
-    # Without this check, experiments could silently use
-    # fewer documents than requested.
+    # Ensure the requested source rows actually existed.
     if len(hosts) != len(requested):
         raise ValueError(
             f"Requested {len(requested)} host rows, "
@@ -758,39 +555,26 @@ def load_hosts(cfg):
 
 
 # ============================================================
-# 5. OBTAIN THE TARGET TEXT SPAN
+# 5. LOAD TARGET TEXT
 # ============================================================
 
 def load_span(source):
     """
-    Resolve the text span to be inserted.
+    Resolve a target span from literal text or an external
+    Hugging Face dataset.
 
-    Two modes are supported:
-
-    1. literal:
-       Use manually specified target text.
-
-    2. hf:
-       Extract text from a selected row and column of
-       another Hugging Face dataset.
-
-    The returned span is inserted INTO existing Pile
-    documents rather than becoming a standalone document.
-
-    This distinction matters because the experiment studies
-    memorization under controlled contextual exposure.
+    For an external dataset, only the selected text span
+    is extracted and inserted into existing Pile hosts.
     """
 
     mode = source["mode"]
 
     if mode == "literal":
 
-        # Directly use the text written in the configuration.
         span = source["text"]
 
     elif mode == "hf":
 
-        # Select the row from the external dataset.
         idx = integer(
             source["index"],
             "source.index"
@@ -803,10 +587,7 @@ def load_span(source):
             source.get("revision")
         )
 
-        # islice skips to the requested row.
-        #
-        # next(..., None) avoids StopIteration if the
-        # requested row does not exist.
+        # Skip to the requested external dataset row.
         row = next(
             islice(rows, idx, idx + 1),
             None
@@ -817,7 +598,6 @@ def load_span(source):
                 f"No row {idx} found in target dataset"
             )
 
-        # Read the selected text field from the external row.
         span = row.get(source["field"])
 
         if not isinstance(span, str):
@@ -826,12 +606,7 @@ def load_span(source):
                 "does not contain text"
             )
 
-        # Optional character slicing of the external text.
-        #
-        # For example:
-        # slice_start=0, slice_end=150
-        #
-        # extracts the first 150 characters.
+        # Optional character-level extraction.
         start = source.get("slice_start")
         end = source.get("slice_end")
 
@@ -848,7 +623,6 @@ def load_span(source):
             f"Unknown span source mode: {mode}"
         )
 
-    # Empty targets are not meaningful insertion objects.
     if not isinstance(span, str) or not span:
         raise ValueError(
             "Target span must be nonempty text"
@@ -858,49 +632,17 @@ def load_span(source):
 
 
 # ============================================================
-# 6. DETERMINE ELIGIBLE DATASET REGIONS
+# 6. DATASET REGION SELECTION
 # ============================================================
 
 def stage_positions(selection, total):
     """
-    Return eligible output document indices for a dataset
-    region.
+    Return eligible output indices for a dataset region.
 
-    This function is used when random host selection
-    specifies an insertion stage.
+    early/middle/late divide the LOADED document sequence
+    into three consecutive regions.
 
-    Stages
-    ------
-    all:
-        All loaded documents.
-
-    early:
-        First third of the loaded document sequence.
-
-    middle:
-        Middle third of the loaded document sequence.
-
-    late:
-        Final third of the loaded document sequence.
-
-    custom:
-        Arbitrary fractional region.
-
-    Example
-    -------
-    Suppose total = 300.
-
-    early  -> indices 0 through 99
-    middle -> indices 100 through 199
-    late   -> indices 200 through 299
-
-    IMPORTANT
-    ---------
-    These regions refer to the LOADED dataset order.
-
-    They do not automatically correspond to early or late
-    training steps because the downstream training pipeline
-    may shuffle documents or repeat epochs.
+    They do not represent actual training update steps.
     """
 
     stage = selection.get("stage", "all")
@@ -930,7 +672,6 @@ def stage_positions(selection, total):
 
     if stage == "custom":
 
-        # Convert fractional boundaries to output indices.
         a = fraction(
             selection["start_fraction"],
             "start_fraction"
@@ -946,7 +687,6 @@ def stage_positions(selection, total):
                 "start_fraction must be less than end_fraction"
             )
 
-        # Integer conversion creates discrete index bounds.
         return list(
             range(
                 int(a * total),
@@ -963,74 +703,48 @@ def stage_positions(selection, total):
 
 
 # ============================================================
-# 7. SELECT HOST DOCUMENTS FOR A TARGET
+# 7. CHOOSE HOST DOCUMENTS FOR A TARGET
 # ============================================================
 
 def choose_hosts(selection, hosts, span, rng):
     """
-    Select the host documents that will receive one target.
+    Select distinct host documents receiving a target.
 
-    This function controls both:
-        1. Insertion frequency
-        2. Dataset-level insertion position
+    Frequency is the number of DISTINCT selected hosts.
 
-    Frequency is defined as the number of DISTINCT selected
-    host documents.
+    Explicit mode uses original Pile source IDs.
+    Range/every_n modes use loaded output indices.
 
-    A given target can appear at most once in a selected host.
-
-    Different targets may share the same host document.
-
-    Returns
-    -------
-    list[int]:
-        Sorted output indices of the chosen host documents.
-
-    Why return sorted indices?
-    --------------------------
-    The modified dataset should preserve the original
-    document sequence, independently of random selection.
+    Hosts already containing the exact target substring
+    are rejected or excluded to prevent preexisting target
+    occurrences from distorting frequency measurements.
     """
 
     mode = selection["mode"]
     total = len(hosts)
 
-    # Map original source IDs to their indices within
-    # the loaded experimental subset.
-    #
-    # Example:
-    # hosts source IDs = [2, 5, 10]
-    #
-    # lookup:
-    #     2  -> 0
-    #     5  -> 1
-    #     10 -> 2
+    # Original source ID -> loaded output index.
     lookup = {
         host["source_id"]: i
         for i, host in enumerate(hosts)
     }
 
     # --------------------------------------------------------
-    # MODE A: EXPLICIT SOURCE DOCUMENT IDS
+    # EXPLICIT SOURCE IDS
     # --------------------------------------------------------
 
     if mode == "explicit":
 
         ids = selection["source_ids"]
 
-        # Validate that every source ID is a valid integer.
         for x in ids:
             integer(x, "selection source ID")
 
-        # Repeated IDs would violate distinct-host frequency.
         if len(set(ids)) != len(ids):
             raise ValueError(
                 "Duplicate explicit source IDs"
             )
 
-        # An explicitly selected host must have been loaded.
-        #
-        # We never silently substitute another document.
         if any(x not in lookup for x in ids):
             raise ValueError(
                 "Explicit selection includes unloaded "
@@ -1041,14 +755,13 @@ def choose_hosts(selection, hosts, span, rng):
 
     else:
 
-        # Other modes specify frequency numerically.
         frequency = integer(
             selection["frequency"],
             "frequency"
         )
 
         # ----------------------------------------------------
-        # MODE B: RANDOM HOSTS FROM DATASET REGION
+        # RANDOM SELECTION FROM A STAGE
         # ----------------------------------------------------
 
         if mode == "random":
@@ -1059,7 +772,7 @@ def choose_hosts(selection, hosts, span, rng):
             )
 
         # ----------------------------------------------------
-        # MODE C: RANDOM HOSTS WITHIN AN INDEX RANGE
+        # RANDOM SELECTION FROM A FIXED INDEX RANGE
         # ----------------------------------------------------
 
         elif mode == "range":
@@ -1083,7 +796,7 @@ def choose_hosts(selection, hosts, span, rng):
             candidates = list(range(a, b))
 
         # ----------------------------------------------------
-        # MODE D: EVERY NTH DOCUMENT
+        # EVERY NTH DOCUMENT
         # ----------------------------------------------------
 
         elif mode == "every_n":
@@ -1108,27 +821,16 @@ def choose_hosts(selection, hosts, span, rng):
                 f"Unknown selection mode: {mode}"
             )
 
-        # ----------------------------------------------------
-        # EXCLUDE PREEXISTING TARGET OCCURRENCES
-        # ----------------------------------------------------
+        # Remove candidate hosts already containing the target.
         #
-        # An important experimental consideration:
-        #
-        # If a host already contains the target, inserting
-        # another copy would make its total occurrence count
-        # different from an otherwise comparable host.
-        #
-        # Therefore, hosts already containing this exact
-        # target string are excluded.
-        #
-        # This checks exact substring presence, not semantic
-        # similarity or tokenizer-level equivalence.
+        # For example, if "my name is apratim" already
+        # occurs in a host, it is not eligible for another
+        # controlled occurrence of that target.
         candidates = [
             i for i in candidates
             if span not in hosts[i]["original_text"]
         ]
 
-        # Ensure requested frequency is feasible.
         if frequency > len(candidates):
             raise ValueError(
                 f"Frequency {frequency} exceeds "
@@ -1137,9 +839,8 @@ def choose_hosts(selection, hosts, span, rng):
 
         if mode in ("random", "range"):
 
-            # random.sample chooses without replacement.
-            #
-            # Thus every selected host is distinct.
+            # Sampling without replacement ensures
+            # distinct host documents.
             chosen = rng.sample(
                 candidates,
                 frequency
@@ -1147,21 +848,10 @@ def choose_hosts(selection, hosts, span, rng):
 
         else:
 
-            # every_n is deterministic.
-            #
-            # Select the first requested number of eligible
-            # candidates in the chosen step pattern.
+            # Every-N selection retains deterministic order.
             chosen = candidates[:frequency]
 
-    # --------------------------------------------------------
-    # FINAL HOST VALIDATION
-    # --------------------------------------------------------
-    #
-    # Explicit selection must also reject documents
-    # already containing the target.
-    #
-    # This prevents a configuration from silently producing
-    # unintended repetition counts.
+    # Explicit selections must also reject preexisting spans.
     for i in chosen:
 
         if span in hosts[i]["original_text"]:
@@ -1174,75 +864,40 @@ def choose_hosts(selection, hosts, span, rng):
 
 
 # ============================================================
-# 8. TOKENIZER-BASED INSERTION BOUNDARIES
+# 8. TOKENIZER-BASED POSITION SUPPORT
 # ============================================================
 
 class TokenOffsets:
     """
-    Convert token-level insertion positions into character
-    offsets of the original document.
+    Convert original token boundaries into character offsets.
 
-    Why is this necessary?
-    ----------------------
-    Python string insertion operates on character indices.
+    A fast tokenizer provides offset_mapping, describing
+    where each token lies in the original character string.
 
-    However, experiments may require placement after a
-    certain number or percentage of tokens.
+    An N-token document has N+1 conceptual boundaries:
+        0 -> before first token
+        N -> after final token
 
-    We therefore:
-        1. Tokenize the original text.
-        2. Retrieve its character offset mapping.
-        3. Identify valid token boundaries.
-        4. Convert the requested token boundary into a
-           character insertion offset.
+    Interior overlapping offsets are rejected because
+    they cannot be represented as unambiguous boundaries.
 
-    IMPORTANT LIMITATION
-    --------------------
-    Inserting text may alter tokenization near the boundary.
-
-    Therefore, an insertion at original token boundary 25
-    does not necessarily remain at exactly token 25 when
-    the modified document is retokenized.
-
-    Offset mappings can also overlap for some tokenizers
-    or Unicode sequences.
-
-    Ambiguous overlapping boundaries are rejected.
+    Tokenization of the modified document can differ from
+    tokenization of the original document.
     """
 
     def __init__(self, cfg):
 
         self.cfg = cfg
-
-        # Tokenizer is initialized only on first use.
         self.tokenizer = None
 
     def boundaries(self, text):
         """
-        Return character offsets representing token
-        boundaries in the original text.
+        Return character offsets for token boundaries.
 
-        If the original text contains N tokens,
-        the returned list has N+1 entries.
-
-        Boundary 0:
-            Start of document.
-
-        Boundary N:
-            End of document.
-
-        Interior boundaries:
-            Character offsets between neighboring tokens.
-
-        None:
-            A boundary whose tokenizer offsets overlap
-            and cannot safely be represented here.
+        None indicates an ambiguous overlapping boundary.
         """
 
-        # ----------------------------------------------------
-        # LAZY TOKENIZER INITIALIZATION
-        # ----------------------------------------------------
-
+        # Lazily initialize the tokenizer.
         if self.tokenizer is None:
 
             from transformers import AutoTokenizer
@@ -1261,25 +916,13 @@ class TokenOffsets:
                 **kwargs
             )
 
-            # Slow tokenizers may not expose offset mappings.
             if not self.tokenizer.is_fast:
                 raise ValueError(
                     "Tokenizer must be fast and support "
                     "offset_mapping"
                 )
 
-        # ----------------------------------------------------
-        # TOKENIZE THE ORIGINAL DOCUMENT
-        # ----------------------------------------------------
-        #
-        # add_special_tokens=False:
-        #   Ignore tokenizer-specific BOS/EOS additions.
-        #
-        # return_offsets_mapping=True:
-        #   Return character start/end for each token.
-        #
-        # truncation=False:
-        #   Prevent silent truncation of the source document.
+        # Tokenize without adding special tokens or truncating.
         encoded = self.tokenizer(
             text,
             add_special_tokens=False,
@@ -1289,41 +932,32 @@ class TokenOffsets:
 
         offsets = encoded["offset_mapping"]
 
-        # Boundary 0 corresponds to the document beginning.
+        # Beginning of original document.
         result = [0]
-
-        # ----------------------------------------------------
-        # COMPUTE INTERIOR TOKEN BOUNDARIES
-        # ----------------------------------------------------
 
         for k in range(1, len(offsets)):
 
-            # End of preceding token.
             prev_end = offsets[k - 1][1]
-
-            # Beginning of following token.
             next_start = offsets[k][0]
 
             if prev_end > next_start:
 
-                # Overlapping offsets indicate that this
-                # boundary cannot be represented cleanly.
+                # Overlapping offsets are ambiguous.
                 result.append(None)
 
             else:
 
-                # Insert immediately after the preceding
-                # token's mapped character span.
+                # Boundary derived from preceding token end.
                 result.append(prev_end)
 
-        # Final boundary is the end of the original string.
+        # End of original document.
         result.append(len(text))
 
         return result
 
 
 # ============================================================
-# 9. RESOLVE POSITION WITHIN ONE DOCUMENT
+# 9. RESOLVE A WITHIN-DOCUMENT INSERTION OFFSET
 # ============================================================
 
 def position_offset(
@@ -1333,74 +967,42 @@ def position_offset(
     token_helper
 ):
     """
-    Translate a position specification into a character
-    insertion offset.
+    Convert a position specification into a character offset
+    within the ORIGINAL document.
 
-    This is the central function for within-document
-    position control.
+    Supported modes:
+        beginning
+        middle
+        end
+        percentage
+        character_offset
+        random_character
+        token_offset
+        random_token
+        token_percentage
 
-    All positions refer to the ORIGINAL host document.
-
-    Parameters
-    ----------
-    text:
-        Original document text.
-
-    specification:
-        Dictionary specifying insertion mode and parameters.
-
-    rng:
-        Random generator used for random positions.
-
-    token_helper:
-        TokenOffsets instance for token-based placement.
-
-    Returns
-    -------
-    int:
-        Character insertion offset in the original text.
-
-    Examples
-    --------
-    Document = "abcdefghij"
-
-    beginning:
-        offset 0
-
-    middle:
-        offset 5
-
-    end:
-        offset 10
-
-    character_offset=3:
-        offset 3
-
-    percentage=0.3:
-        approximately offset 3
+    All returned offsets are original-text character indices.
     """
 
     mode = specification["mode"]
     length = len(text)
 
     # --------------------------------------------------------
-    # BEGINNING OF DOCUMENT
+    # DOCUMENT BEGINNING
     # --------------------------------------------------------
 
     if mode == "beginning":
         return 0
 
     # --------------------------------------------------------
-    # MIDDLE OF DOCUMENT
+    # DOCUMENT MIDDLE (CHARACTER-BASED)
     # --------------------------------------------------------
-    #
-    # Character-based midpoint.
-    # For odd lengths, integer division rounds downward.
+
     if mode == "middle":
         return length // 2
 
     # --------------------------------------------------------
-    # END OF DOCUMENT
+    # DOCUMENT END
     # --------------------------------------------------------
 
     if mode == "end":
@@ -1410,17 +1012,13 @@ def position_offset(
     # RANDOM CHARACTER BOUNDARY
     # --------------------------------------------------------
     #
-    # randint is inclusive at both endpoints.
-    #
-    # Possible positions:
-    #     0, 1, 2, ..., length
-    #
-    # Thus beginning and end are also possible.
+    # Includes both the beginning and end of the document.
+
     if mode == "random_character":
         return rng.randint(0, length)
 
     # --------------------------------------------------------
-    # PERCENTAGE OF ORIGINAL CHARACTER LENGTH
+    # FRACTION OF ORIGINAL CHARACTER LENGTH
     # --------------------------------------------------------
 
     if mode == "percentage":
@@ -1430,14 +1028,11 @@ def position_offset(
             "percentage"
         )
 
-        # Python round() is used to choose an integer offset.
-        #
-        # This may split a word because percentage placement
-        # does not enforce whitespace or token boundaries.
+        # This can produce an offset inside a word.
         return round(length * value)
 
     # --------------------------------------------------------
-    # EXACT ORIGINAL CHARACTER OFFSET
+    # EXACT CHARACTER OFFSET
     # --------------------------------------------------------
 
     if mode == "character_offset":
@@ -1447,7 +1042,6 @@ def position_offset(
             "character_offset"
         )
 
-        # Reject attempts to insert beyond the document end.
         if offset > length:
             raise ValueError(
                 f"Character offset {offset} exceeds "
@@ -1457,7 +1051,7 @@ def position_offset(
         return offset
 
     # --------------------------------------------------------
-    # TOKEN-BASED POSITION MODES
+    # TOKEN-BASED POSITIONS
     # --------------------------------------------------------
 
     if mode in (
@@ -1466,15 +1060,12 @@ def position_offset(
         "token_percentage"
     ):
 
-        # Generate the boundary mapping for this document.
         boundaries = token_helper.boundaries(text)
 
-        # N tokens produce N+1 possible boundary entries.
         token_count = len(boundaries) - 1
 
         if mode == "token_offset":
 
-            # The requested boundary index is explicit.
             k = integer(
                 specification["value"],
                 "token_offset"
@@ -1482,8 +1073,6 @@ def position_offset(
 
         elif mode == "token_percentage":
 
-            # Convert a fraction of the original token count
-            # into a token boundary index.
             value = fraction(
                 specification["value"],
                 "token_percentage"
@@ -1493,10 +1082,7 @@ def position_offset(
 
         else:
 
-            # Randomly choose among valid token boundaries.
-            #
-            # Boundaries marked None represent overlapping
-            # token offsets and are excluded.
+            # Only choose valid, non-overlapping boundaries.
             valid = [
                 k
                 for k, value in enumerate(boundaries)
@@ -1505,22 +1091,18 @@ def position_offset(
 
             k = rng.choice(valid)
 
-        # Validate the token index.
         if k > token_count:
             raise ValueError(
                 f"Token offset {k} exceeds original "
                 f"token count {token_count}"
             )
 
-        # Reject ambiguous tokenizer boundaries.
         if boundaries[k] is None:
             raise ValueError(
                 f"Token boundary {k} overlaps in tokenizer "
                 "offset mapping; choose another boundary"
             )
 
-        # The actual string insertion always uses a
-        # character offset, even in token-based modes.
         return boundaries[k]
 
     raise ValueError(
@@ -1529,7 +1111,7 @@ def position_offset(
 
 
 # ============================================================
-# 10. APPLY CONTROLLED INSERTIONS
+# 10. MAIN INSERTION ENGINE
 # ============================================================
 
 def apply_insertions(
@@ -1538,64 +1120,40 @@ def apply_insertions(
     resolved_spans=None
 ):
     """
-    Main controlled insertion engine.
+    Apply all configured target insertions.
 
-    The implementation has two conceptual phases:
+    PHASE A: PLAN
+        Resolve targets, choose hosts, and compute positions
+        using the ORIGINAL host documents.
 
-    PHASE A: PLAN INSERTIONS
-    ------------------------
-    For each target:
-        1. Resolve target text.
-        2. Select host documents.
-        3. Determine each host's insertion offset.
-        4. Store the insertion plan.
+    PHASE B: APPLY
+        Apply all planned insertions, preserving original text
+        and document ordering.
 
-    PHASE B: APPLY INSERTIONS
-    -------------------------
-    For each original host document:
-        1. Collect all planned insertions.
-        2. Sort them by original character offset.
-        3. Construct modified text.
-        4. Record inserted text locations.
-        5. Verify original text preservation.
+    PHASE C: VALIDATE
+        Verify recorded span positions, original-text
+        reconstruction, and per-target insertion frequency.
 
-    Finally, verify insertion frequency for every target.
-
-    WHY PLAN BEFORE APPLYING?
-    -------------------------
-    Several targets may be inserted into the same document.
-
-    If we inserted each target immediately, earlier
-    insertions would shift the character offsets of later
-    insertions.
-
-    By planning against the ORIGINAL text, every position
-    remains independent of previously inserted targets.
+    Multiple targets may share the same host document.
 
     Returns
     -------
     output_documents:
-        Complete selected dataset with modified text.
+        Modified and unmodified document records.
 
     target_info:
-        Metadata summarizing each target and its hosts.
+        Target-level experimental metadata.
 
     insertion_records:
-        Detailed records describing individual insertions.
+        Individual insertion records.
     """
 
-    # Use a dedicated deterministic random generator.
     rng = random.Random(cfg["seed"])
 
     if not hosts:
         raise ValueError("No hosts")
 
-    # --------------------------------------------------------
-    # VERIFY ORIGINAL HOST ORDER
-    # --------------------------------------------------------
-    #
-    # The loader should already preserve source order.
-    # This is an additional defensive validation.
+    # Verify distinct, ascending original source IDs.
     source_ids = [
         host["source_id"]
         for host in hosts
@@ -1607,9 +1165,7 @@ def apply_insertions(
             "in original Pile order"
         )
 
-    # Retain original texts for all insertion calculations.
-    #
-    # These strings must not be mutated during planning.
+    # Preserve original texts throughout planning.
     originals = [
         host["original_text"]
         for host in hosts
@@ -1617,25 +1173,14 @@ def apply_insertions(
 
     token_helper = TokenOffsets(cfg)
 
-    # planned maps:
-    #
-    #     output_document_index -> list of insertions
-    #
-    # Example:
-    #
-    # planned[5] = [
-    #     {"target_id": "target_1", "offset": 30, ...},
-    #     {"target_id": "target_2", "offset": 100, ...}
-    # ]
+    # Maps output document index -> planned insertions.
     planned = defaultdict(list)
 
     target_info = []
-
-    # Prevent duplicate logical target identifiers.
     seen_ids = set()
 
     # ========================================================
-    # PHASE A: PLAN ALL INSERTIONS
+    # PHASE A: PLAN ALL TARGET INSERTIONS
     # ========================================================
 
     for target_index, target in enumerate(cfg["targets"]):
@@ -1650,15 +1195,11 @@ def apply_insertions(
         seen_ids.add(target_id)
 
         # ----------------------------------------------------
-        # STEP A1: RESOLVE TARGET SPAN
+        # A1. RESOLVE TARGET TEXT
         # ----------------------------------------------------
-        #
-        # resolved_spans optionally lets another part of
-        # the project supply already-loaded target strings.
-        #
-        # Otherwise, load the target using the configuration.
+
         if (
-            resolved_spans
+            resolved_spans is not None
             and target_id in resolved_spans
         ):
             span = resolved_spans[target_id]
@@ -1672,11 +1213,9 @@ def apply_insertions(
             )
 
         # ----------------------------------------------------
-        # STEP A2: CHOOSE HOST DOCUMENTS
+        # A2. SELECT DISTINCT HOST DOCUMENTS
         # ----------------------------------------------------
-        #
-        # Host selection controls dataset-level placement
-        # and repetition frequency.
+
         chosen = choose_hosts(
             target["selection"],
             hosts,
@@ -1685,21 +1224,15 @@ def apply_insertions(
         )
 
         # ----------------------------------------------------
-        # STEP A3: DETERMINE POSITION FOR EACH SELECTED HOST
+        # A3. RESOLVE EACH HOST'S INSERTION POSITION
         # ----------------------------------------------------
 
         for i in chosen:
 
             host = hosts[i]
 
-            # Look for a document-specific position override.
-            #
-            # Priority:
-            #   1. per_document_positions[source_id]
-            #   2. default target["position"]
-            #
-            # Thus individual hosts can have different
-            # insertion positions even for the same target.
+            # Document-specific overrides take precedence
+            # over the target's default position.
             position_spec = target.get(
                 "per_document_positions",
                 {}
@@ -1708,8 +1241,7 @@ def apply_insertions(
                 target["position"]
             )
 
-            # Resolve the requested position using ORIGINAL
-            # text rather than previously modified text.
+            # Compute offset using original document text.
             offset = position_offset(
                 originals[i],
                 position_spec,
@@ -1717,13 +1249,9 @@ def apply_insertions(
                 token_helper
             )
 
-            # Store the planned insertion.
-            #
-            # target_order is important when two targets
-            # share the same character insertion offset.
-            #
-            # It provides a deterministic tie-breaking order
-            # matching the order of targets in CONFIG.
+            # Store the insertion rather than applying it
+            # immediately. This prevents earlier insertions
+            # from shifting later original-text offsets.
             planned[i].append({
 
                 "target_id": target_id,
@@ -1738,11 +1266,9 @@ def apply_insertions(
             })
 
         # ----------------------------------------------------
-        # STEP A4: RECORD TARGET-LEVEL METADATA
+        # A4. RECORD TARGET-LEVEL METADATA
         # ----------------------------------------------------
-        #
-        # This summarizes the target's actual selected hosts,
-        # frequency, source configuration, and exact text.
+
         target_info.append({
 
             "id": target_id,
@@ -1762,33 +1288,21 @@ def apply_insertions(
         })
 
     # ========================================================
-    # PHASE B: BUILD THE MODIFIED DOCUMENTS
+    # PHASE B: APPLY INSERTIONS
     # ========================================================
 
     output_documents = []
-
     insertion_records = []
 
-    # Process hosts in original source order.
-    #
-    # Every host produces exactly one output document,
-    # whether it receives zero, one, or multiple insertions.
+    # Process every host in original dataset order.
     for i, host in enumerate(hosts):
 
         original_text = originals[i]
 
-        # ----------------------------------------------------
-        # SORT ALL INSERTIONS FOR THIS DOCUMENT
-        # ----------------------------------------------------
+        # Sort insertions by original character position.
         #
-        # Primary key:
-        #   Original character offset.
-        #
-        # Secondary key:
-        #   Target order in CONFIG.
-        #
-        # This ensures deterministic handling of multiple
-        # targets that share an insertion position.
+        # If two targets share the same offset, their
+        # configuration order breaks the tie.
         placements = sorted(
             planned[i],
             key=lambda p: (
@@ -1797,27 +1311,18 @@ def apply_insertions(
             )
         )
 
-        # Instead of repeatedly modifying a Python string,
-        # accumulate text fragments and join them once.
-        #
-        # This also makes offset tracking straightforward.
+        # Build modified text from fragments to avoid
+        # repeatedly copying the entire document.
         pieces = []
 
-        # cursor tracks how much ORIGINAL text was copied.
+        # Position already consumed in ORIGINAL text.
         cursor = 0
 
-        # output_length tracks the constructed string length.
-        #
-        # It lets us record exact target locations in the
-        # final modified document.
+        # Number of characters already emitted in output.
         output_length = 0
 
         # Records for insertions into this particular host.
         own_records = []
-
-        # ----------------------------------------------------
-        # INSERT EACH PLANNED TARGET
-        # ----------------------------------------------------
 
         for placement in placements:
 
@@ -1826,38 +1331,23 @@ def apply_insertions(
             # ------------------------------------------------
             # B1. COPY ORIGINAL TEXT BEFORE INSERTION
             # ------------------------------------------------
-            #
-            # Copy only original text between the previous
-            # insertion point and the current insertion point.
-            #
-            # When two targets share an offset, this segment
-            # is empty for the second insertion.
+
             segment = original_text[cursor:offset]
 
             pieces.append(segment)
-
             output_length += len(segment)
 
             # ------------------------------------------------
-            # B2. ADD TEXT SEPARATORS
+            # B2. ADD INSERTION SEPARATORS
             # ------------------------------------------------
             #
-            # Two newlines are used to visually separate
-            # the inserted span from surrounding text.
+            # Separate target text from the original context.
             #
-            # At offset 0:
-            #   No leading separator is needed.
+            # No left separator at document beginning.
+            # No right separator at original document end.
             #
-            # At original document end:
-            #   No trailing separator is needed.
-            #
-            # IMPORTANT:
-            # These separators are ADDITIONAL text.
-            # They are recorded and removed during
-            # original-text reconstruction validation.
-            #
-            # They can affect the model's tokenization
-            # and experimental context.
+            # Separators are additional text and are recorded
+            # separately for exact reconstruction.
             left_separator = (
                 "\n\n"
                 if offset > 0
@@ -1871,15 +1361,10 @@ def apply_insertions(
             )
 
             # ------------------------------------------------
-            # B3. CALCULATE MODIFIED-TEXT TARGET OFFSETS
+            # B3. CALCULATE TARGET OFFSETS IN MODIFIED TEXT
             # ------------------------------------------------
             #
-            # The target starts AFTER any leading separator.
-            #
-            # These offsets refer to the FINAL modified text,
-            # not the original document.
-            #
-            # Python slicing uses exclusive end offsets.
+            # start is inclusive; end is exclusive.
             span_start = (
                 output_length
                 + len(left_separator)
@@ -1891,16 +1376,9 @@ def apply_insertions(
             )
 
             # ------------------------------------------------
-            # B4. APPEND THE INSERTED SPAN
+            # B4. APPEND INSERTED CONTENT
             # ------------------------------------------------
-            #
-            # The insertion consists of:
-            #
-            #   optional leading separator
-            #   target text
-            #   optional trailing separator
-            #
-            # No original text is deleted here.
+
             pieces.extend((
                 left_separator,
                 placement["span"],
@@ -1914,21 +1392,9 @@ def apply_insertions(
             )
 
             # ------------------------------------------------
-            # B5. RECORD EXACT INSERTION DETAILS
+            # B5. SAVE INSERTION DETAILS
             # ------------------------------------------------
-            #
-            # This metadata enables:
-            #   - Experimental auditing
-            #   - Frequency verification
-            #   - Position analysis
-            #   - Exact target extraction
-            #   - Reconstruction validation
-            #
-            # original_character_offset:
-            #   Insertion boundary in original text.
-            #
-            # inserted_start_char / inserted_end_char:
-            #   Target's character interval in modified text.
+
             record = {
 
                 "target_id": placement["target_id"],
@@ -1954,61 +1420,36 @@ def apply_insertions(
 
             own_records.append(record)
 
-            # Advance the cursor to the insertion boundary
-            # in the original document.
-            #
-            # The inserted target itself is not part of
-            # the original text and does not advance cursor.
+            # Advance through original text only.
             cursor = offset
 
         # ----------------------------------------------------
-        # B6. APPEND REMAINING ORIGINAL DOCUMENT TEXT
+        # B6. APPEND REMAINING ORIGINAL TEXT
         # ----------------------------------------------------
-        #
-        # All text after the final insertion point must
-        # remain in the output.
+
         pieces.append(original_text[cursor:])
 
-        # Construct the complete modified document.
         modified_text = "".join(pieces)
 
         # ====================================================
-        # PHASE C: VALIDATE ORIGINAL TEXT PRESERVATION
+        # PHASE C: VERIFY ORIGINAL-TEXT PRESERVATION
         # ====================================================
         #
-        # Core correctness requirement:
+        # The original document must be recoverable by
+        # removing every inserted span and its separators.
         #
-        # If all inserted spans and their separators are
-        # removed, the result must exactly match the
-        # original Pile document.
-        #
-        # This protects against accidental text deletion,
-        # duplication, or offset miscalculation.
+        # Reverse-order removal is necessary because deleting
+        # later insertions does not shift earlier offsets.
         # ====================================================
 
         reconstructed = modified_text
 
-        # ----------------------------------------------------
-        # REMOVE INSERTIONS IN REVERSE ORDER
-        # ----------------------------------------------------
-        #
-        # Why reverse order?
-        #
-        # Removing text from the end of a string does not
-        # change earlier character offsets.
-        #
-        # If insertions were removed from the beginning,
-        # later recorded positions would become invalid.
-        #
-        # Reverse-order removal also handles several targets
-        # inserted into the same original document.
         for record in reversed(own_records):
 
             start = record["inserted_start_char"]
             end = record["inserted_end_char"]
 
-            # First verify the target really appears at
-            # its recorded modified-text offsets.
+            # Verify exact target text at its recorded offset.
             if (
                 reconstructed[start:end]
                 != record["inserted_span"]
@@ -2017,47 +1458,30 @@ def apply_insertions(
                     "Inserted span or offset mismatch"
                 )
 
-            # Include the leading separator in the removal.
+            # Include the recorded separators in removal.
             remove_start = (
                 start
                 - len(record["left_separator"])
             )
 
-            # Include the trailing separator in the removal.
             remove_end = (
                 end
                 + len(record["right_separator"])
             )
 
-            # Remove the complete insertion and join
-            # the surrounding original text.
             reconstructed = (
                 reconstructed[:remove_start]
                 + reconstructed[remove_end:]
             )
 
-        # ----------------------------------------------------
-        # VERIFY EXACT ORIGINAL DOCUMENT RECONSTRUCTION
-        # ----------------------------------------------------
-        #
-        # Equality is character-for-character.
-        #
-        # Any unintended alteration to original text causes
-        # the experiment to stop with an error.
+        # Exact character-for-character comparison.
         if reconstructed != original_text:
             raise RuntimeError(
                 "Original text was not preserved in "
                 f"Pile document {host['source_id']}"
             )
 
-        # ----------------------------------------------------
-        # SAVE THE FINAL DOCUMENT RECORD
-        # ----------------------------------------------------
-        #
-        # Unmodified documents have insertion_count = 0
-        # and their text remains unchanged.
-        #
-        # Both original and modified text hashes are saved.
+        # Store the complete document, even if unmodified.
         output_documents.append({
 
             "pile_source_id": host["source_id"],
@@ -2076,19 +1500,12 @@ def apply_insertions(
         insertion_records.extend(own_records)
 
     # ========================================================
-    # PHASE D: VERIFY TARGET FREQUENCY
+    # PHASE D: VERIFY PER-TARGET FREQUENCY
     # ========================================================
     #
-    # For every target, verify that:
-    #
-    # 1. The number of recorded insertions matches the
-    #    planned target frequency.
-    #
-    # 2. Each insertion is in a distinct host document.
-    #
-    # This ensures that frequency means the number of
-    # documents receiving the target, rather than the
-    # number of repeated copies inside one document.
+    # Check that:
+    #   1. Recorded insertion count matches planned frequency.
+    #   2. Every insertion for a target uses a distinct host.
     # ========================================================
 
     for target in target_info:
@@ -2121,35 +1538,27 @@ def apply_insertions(
 
 
 # ============================================================
-# 11. EXPERIMENT EXECUTION AND OUTPUT
+# 11. RUN EXPERIMENT AND SAVE OUTPUTS
 # ============================================================
 
 def main():
     """
-    Execute one controlled insertion experiment.
+    Execute the controlled insertion experiment.
 
-    Workflow
-    --------
-    1. Validate output directory availability.
-    2. Load selected Pile documents.
-    3. Apply target insertions.
-    4. Build final JSON dataset.
-    5. Build insertion metadata.
-    6. Save results.
-    7. Print experimental summary.
+    Outputs:
+        modified_dataset.json
+        insertion_metadata.json
 
-    No model training is performed.
+    The script does not modify the original Hugging Face
+    dataset or perform any model training.
     """
 
     output_dir = Path(CONFIG["output_dir"])
 
     # --------------------------------------------------------
-    # A. PREVENT ACCIDENTAL OVERWRITING
+    # PREVENT ACCIDENTAL EXPERIMENT OVERWRITING
     # --------------------------------------------------------
-    #
-    # Experiments should remain independently reproducible.
-    #
-    # Therefore, existing output directories are rejected.
+
     if output_dir.exists():
         raise FileExistsError(
             "Choose a new output_dir. "
@@ -2157,7 +1566,7 @@ def main():
         )
 
     # --------------------------------------------------------
-    # B. LOAD ORIGINAL HOST DOCUMENTS
+    # LOAD ORIGINAL HOST DOCUMENTS
     # --------------------------------------------------------
 
     print("Loading selected Pile documents...")
@@ -2169,11 +1578,9 @@ def main():
     )
 
     # --------------------------------------------------------
-    # C. PERFORM CONTROLLED INSERTIONS
+    # PERFORM CONTROLLED INSERTIONS AND VALIDATION
     # --------------------------------------------------------
-    #
-    # This operation performs the selection, insertion,
-    # offset calculation, and correctness validation.
+
     print("Applying controlled insertions...")
 
     documents, targets, insertions = apply_insertions(
@@ -2182,24 +1589,15 @@ def main():
     )
 
     # ========================================================
-    # OUTPUT FILE 1: MODIFIED DATASET
+    # OUTPUT 1: COMPLETE MODIFIED DATASET
     # ========================================================
     #
-    # The result is ONE complete JSON object containing
-    # all loaded documents in their original order.
+    # The output contains every loaded host document,
+    # including documents that received no insertions.
     #
-    # Each document has:
-    #   pile_source_id
-    #   output_document_index
-    #   text
-    #   original_sha256
-    #   modified_sha256
-    #   insertion_count
+    # Documents remain in original source order.
     #
-    # Documents without insertions are retained.
-    #
-    # The configuration is included so the dataset can be
-    # associated with the experiment that produced it.
+    # The dataset is saved as ONE JSON object.
     # ========================================================
 
     result = {
@@ -2211,11 +1609,6 @@ def main():
         "document_order":
             "original_pile_stream_order_no_shuffle",
 
-        # Dataset modification cannot guarantee actual
-        # training exposure order.
-        #
-        # Downstream training code must explicitly preserve
-        # ordering if it is part of the experiment.
         "training_time_exposure":
             "not_controlled_by_dataset_editing",
 
@@ -2227,22 +1620,14 @@ def main():
     }
 
     # ========================================================
-    # OUTPUT FILE 2: INSERTION METADATA
+    # OUTPUT 2: INSERTION METADATA
     # ========================================================
     #
-    # This file describes the intervention rather than
-    # storing the complete modified dataset.
+    # Records experimental configuration, target frequencies,
+    # original host IDs, and exact insertion positions.
     #
-    # It is useful for later memorization analysis.
-    #
-    # Example research questions:
-    #
-    # - Which documents received target_1?
-    # - What was the exact inserted target string?
-    # - At what original offsets was it inserted?
-    # - What was the insertion frequency?
-    # - Did target_1 appear in early or late documents?
-    # - Where can inserted text be found in final documents?
+    # The metadata is intended to support reproducibility
+    # and subsequent memorization analysis.
     # ========================================================
 
     metadata = {
@@ -2270,7 +1655,7 @@ def main():
     }
 
     # --------------------------------------------------------
-    # D. CREATE OUTPUT DIRECTORY
+    # CREATE EXPERIMENT OUTPUT DIRECTORY
     # --------------------------------------------------------
 
     output_dir.mkdir(
@@ -2287,17 +1672,12 @@ def main():
     )
 
     # --------------------------------------------------------
-    # E. SAVE COMPLETE MODIFIED DATASET
+    # SAVE COMPLETE MODIFIED DATASET
     # --------------------------------------------------------
     #
-    # JSON format:
-    # A single JSON object containing the document list.
-    #
-    # ensure_ascii=False preserves Unicode text.
-    #
-    # indent=2 makes the file human-readable.
-    #
-    # File mode "x" prevents overwriting an existing file.
+    # ensure_ascii=False preserves Unicode characters.
+    # indent=2 creates human-readable JSON.
+    # "x" prevents accidental file overwriting.
     with dataset_file.open(
         "x",
         encoding="utf-8"
@@ -2311,7 +1691,7 @@ def main():
         )
 
     # --------------------------------------------------------
-    # F. SAVE EXPERIMENTAL INSERTION METADATA
+    # SAVE INSERTION METADATA
     # --------------------------------------------------------
 
     with metadata_file.open(
@@ -2327,17 +1707,7 @@ def main():
         )
 
     # ========================================================
-    # 12. PRINT EXPERIMENT SUMMARY
-    # ========================================================
-    #
-    # This summary helps researchers quickly verify:
-    #
-    #   - Number of processed Pile documents
-    #   - Number of performed insertions
-    #   - Locations of generated output files
-    #   - Selected source IDs and insertion offsets
-    #
-    # Full experimental details remain in the metadata JSON.
+    # PRINT FINAL EXPERIMENT SUMMARY
     # ========================================================
 
     print("\nCONTROLLED INSERTION COMPLETE")
@@ -2378,12 +1748,10 @@ def main():
 # PROGRAM ENTRY POINT
 # ============================================================
 #
-# This ensures main() executes only when this script is run
-# directly.
+# Execute main() only when running this script directly.
 #
-# If the script is imported by another Python module,
-# its functions and configuration can be reused without
-# automatically loading datasets or writing output files.
+# Importing the module from another Python script will not
+# automatically download datasets or create output files.
 # ============================================================
 
 if __name__ == "__main__":
