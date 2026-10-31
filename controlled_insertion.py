@@ -5,11 +5,6 @@
 CONTROLLED SPAN INSERTION INTO THE PILE DATASET
 ================================================
 
-PROJECT OBJECTIVE
------------------
-Investigate how insertion frequency, dataset position, and
-within-document position influence language model memorization.
-
 This script modifies the dataset only. It does not train models.
 
 WORKFLOW
