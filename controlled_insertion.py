@@ -1,642 +1,918 @@
 
 #!/usr/bin/env python3
-
 """
-CONTROLLED SPAN INSERTION INTO THE PILE DATASET
-================================================
+CONTROLLED INSERTION INTO THE PILE
+==================================
 
-This script modifies the dataset only. It does not train models.
+Parameter 1: Frequency
+    - Explicit document IDs
+    - Random documents
+    - Every-Nth document
+    - Selected ranges
 
-WORKFLOW
---------
-1. Load selected documents from the original Pile dataset.
-2. Obtain one or more target text spans.
-3. Select existing Pile documents to receive each target.
-4. Determine the insertion position within each document.
-5. Insert target text without deleting original document text.
-6. Validate insertion positions, frequency, and text preservation.
-7. Save the modified dataset and detailed insertion metadata.
+Parameter 2: Dataset position
+    - Early / middle / late / all
+    - Custom dataset regions
 
-IMPORTANT DEFINITIONS
----------------------
-Source ID:
-    Zero-based row index in the original Pile dataset stream.
+Parameter 3: Within-document position
+    - Beginning / middle / end
+    - Character offset / fraction / random
+    - Token offset / fraction / random
+    - Character fraction + delimiter
+    - Token fraction + delimiter
 
-Output document index:
-    Zero-based position within the loaded experimental subset.
+Additional functionality:
+    - Any compatible Hugging Face tokenizer
+    - Arbitrary literal or external-dataset spans
+    - Random external passage sampling
+    - Multiple independent targets
+    - Per-document position overrides
+    - Final token-position observations
 
-Frequency:
-    Number of distinct host documents receiving a target.
-    Each target is inserted at most once per selected host.
+Outputs:
+    modified_dataset.jsonl
+    original_hosts.jsonl
+    insertion_metadata.json
 
-Character offset:
-    Insertion position in the ORIGINAL document.
+Install:
+    pip install -U datasets transformers
 
-Token offset:
-    Character position derived from token boundaries in the
-    ORIGINAL document. Retokenization may change boundaries.
-
-Dataset position:
-    Position within the loaded, unshuffled document sequence.
-    Actual training exposure depends on the downstream trainer.
-
-INSTALL
--------
-pip install -U datasets transformers
-
-OUTPUT
-------
-modified_dataset.json:
-    Complete selected dataset, including unmodified documents.
-
-insertion_metadata.json:
-    Target descriptions, insertion positions, frequencies,
-    and experimental configuration.
+Run:
+    python controlled_insertion.py
 """
 
+import copy
 import hashlib
 import json
+import math
 import random
 
-from pathlib import Path
-from itertools import islice
 from collections import defaultdict
+from itertools import islice
+from pathlib import Path
 
 
 # ============================================================
 # 1. EXPERIMENT CONFIGURATION
 # ============================================================
-#
-# Researchers should normally modify only this section.
-#
-# The configuration separates:
-#   1. Base dataset selection
-#   2. Randomness and tokenizer settings
-#   3. Output directory
-#   4. Target spans
-#   5. Insertion frequency and document selection
-#   6. Within-document insertion positions
-# ============================================================
 
 CONFIG = {
+    "pile": {
+        "name": "EleutherAI/the_pile_deduplicated",
+        "config": None,
+        "split": "train",
+        "revision": None,
 
-    # --------------------------------------------------------
-    # A. BASE DATASET
-    # --------------------------------------------------------
-    #
-    # We insert target text into existing Pile documents.
-    # No additional Pile documents are created.
-    # --------------------------------------------------------
+        "take": {
+            "mode": "first_n",
+            "n": 100
+        }
 
-    "dataset": "EleutherAI/the_pile_deduplicated",
-
-    # Optional named Hugging Face dataset configuration.
-    "dataset_config": None,
-
-    # Optional fixed revision for reproducibility.
-    "dataset_revision": None,
-
-    "split": "train",
-
-
-    # --------------------------------------------------------
-    # B. SELECT ORIGINAL PILE DOCUMENTS TO LOAD
-    # --------------------------------------------------------
-    #
-    # This determines the experimental document pool.
-    #
-    # OPTION 1: Load first N documents
-    #
-    # {"mode": "first_n", "n": 100}
-    #
-    # OPTION 2: Load specific original source IDs
-    #
-    # {"mode": "source_ids", "ids": [0, 2, 5, 10]}
-    #
-    # OPTION 3: Load a source ID range
-    #
-    # {"mode": "source_range", "start": 100, "stop": 300}
-    #
-    # The stop index is exclusive.
-    #
-    # Loading documents does not necessarily mean
-    # inserting target text into all of them.
-    # --------------------------------------------------------
-
-    "take": {
-        "mode": "first_n",
-        "n": 100
+        # Alternatives:
+        #
+        # "take": {
+        #     "mode": "source_ids",
+        #     "ids": [2, 5, 100]
+        # }
+        #
+        # "take": {
+        #     "mode": "source_range",
+        #     "start": 100,
+        #     "stop": 200
+        # }
     },
 
-
-    # --------------------------------------------------------
-    # C. RANDOM SEED
-    # --------------------------------------------------------
-    #
-    # Controls random host selection and random placement.
-    # Does not shuffle the dataset.
-    # --------------------------------------------------------
-
-    "seed": 42,
-
-
-    # --------------------------------------------------------
-    # D. TOKENIZER
-    # --------------------------------------------------------
-    #
-    # Used only when token-based placement is requested.
-    # Must support fast-tokenizer offset mappings.
-    # --------------------------------------------------------
-
-    "tokenizer": "gpt2",
+    # Only the entry point loads the tokenizer.
+    # All insertion functions receive the object.
+    "tokenizer_name": "gpt2",
     "tokenizer_revision": None,
 
+    "seed": 42,
+    "separator": "\n\n",
+    "output_dir": "pile_run_001",
 
-    # --------------------------------------------------------
-    # E. OUTPUT DIRECTORY
-    # --------------------------------------------------------
-    #
-    # Existing experiment directories are not overwritten.
-    # Change this for every new experiment.
-    # --------------------------------------------------------
-
-    "output_dir": "pile_final_run_1",
-
-
-    # --------------------------------------------------------
-    # F. TARGET SPANS
-    # --------------------------------------------------------
-    #
-    # Each target is configured independently.
-    #
-    # Different targets may have different:
-    #   - Text sources
-    #   - Frequencies
-    #   - Host documents
-    #   - Insertion positions
-    #
-    # Multiple different targets may share a host document.
-    # --------------------------------------------------------
-
+    # Manually configured target spans.
     "targets": [
-
         {
-            # Unique target identifier.
-            "id": "target_1",
-
-
-            # ------------------------------------------------
-            # F1. TARGET TEXT SOURCE
-            # ------------------------------------------------
-            #
-            # OPTION A: Literal text
-            #
-            # "source": {
-            #     "mode": "literal",
-            #     "text": "my name is apratim"
-            # }
-            #
-            # OPTION B: Text from another Hugging Face dataset
-            #
-            # "source": {
-            #     "mode": "hf",
-            #     "dataset": "SetFit/bbc-news",
-            #     "dataset_config": None,
-            #     "revision": None,
-            #     "split": "train",
-            #     "index": 0,
-            #     "field": "text",
-            #     "slice_start": 0,
-            #     "slice_end": 150
-            # }
-            #
-            # For HF mode:
-            #   index       = external dataset row
-            #   field       = field containing text
-            #   slice_start = first selected character
-            #   slice_end   = exclusive ending character
-            #
-            # Only the extracted span is inserted.
-            # The external document is not added separately.
-            # ------------------------------------------------
+            "id": "example",
 
             "source": {
                 "mode": "literal",
                 "text": "my name is apratim"
             },
 
-
-            # ------------------------------------------------
-            # F2. FREQUENCY AND HOST-DOCUMENT SELECTION
-            # ------------------------------------------------
-            #
-            # OPTION A: Explicit source IDs
-            #
-            # {"mode": "explicit", "source_ids": [2, 5, 10]}
-            #
-            # Frequency = 3 distinct documents.
-            #
-            # OPTION B: Random hosts
-            #
-            # {"mode": "random",
-            #  "frequency": 10,
-            #  "stage": "all"}
-            #
-            # Available stages:
-            #   all
-            #   early
-            #   middle
-            #   late
-            #
-            # OPTION C: Random hosts in a custom region
-            #
-            # {"mode": "random",
-            #  "frequency": 10,
-            #  "stage": "custom",
-            #  "start_fraction": 0.20,
-            #  "end_fraction": 0.80}
-            #
-            # OPTION D: Every Nth document
-            #
-            # {"mode": "every_n",
-            #  "frequency": 10,
-            #  "every_n": 5,
-            #  "start_output_index": 0}
-            #
-            # OPTION E: Random hosts from a fixed range
-            #
-            # {"mode": "range",
-            #  "frequency": 10,
-            #  "start_output_index": 20,
-            #  "stop_output_index": 80}
-            #
-            # Explicit selection uses ORIGINAL source IDs.
-            # Range/every_n use LOADED output indices.
-            # ------------------------------------------------
-
             "selection": {
                 "mode": "explicit",
                 "source_ids": [2, 5, 10]
             },
 
-
-            # ------------------------------------------------
-            # F3. DEFAULT WITHIN-DOCUMENT POSITION
-            # ------------------------------------------------
-            #
-            # {"mode": "beginning"}
-            # {"mode": "middle"}
-            # {"mode": "end"}
-            #
-            # {"mode": "percentage", "value": 0.37}
-            #
-            # {"mode": "character_offset", "value": 50}
-            #
-            # {"mode": "random_character"}
-            #
-            # {"mode": "token_offset", "value": 25}
-            #
-            # {"mode": "random_token"}
-            #
-            # {"mode": "token_percentage", "value": 0.50}
-            #
-            # Percentages must be between 0 and 1.
-            #
-            # Every position is resolved against the ORIGINAL
-            # host text, not text modified by other insertions.
-            # ------------------------------------------------
-
             "position": {
-                "mode": "percentage",
-                "value": 0.37
+                "mode": "token_fraction_delimiter",
+                "fraction": 0.5,
+                "delimiters": [".", "\n"],
+                "on_missing": "error"
             },
 
-
-            # ------------------------------------------------
-            # F4. DOCUMENT-SPECIFIC POSITION OVERRIDES
-            # ------------------------------------------------
-            #
-            # Keys are ORIGINAL Pile source IDs as strings.
-            #
-            # These override the default position above.
-            #
-            # Example:
-            #   Document 2  -> 10% of character length
-            #   Document 5  -> character offset 30
-            #   Document 10 -> end of document
-            #
-            # This enables positional diversity while keeping
-            # the same target text and insertion frequency.
-            # ------------------------------------------------
-
             "per_document_positions": {
-
-                "2": {
-                    "mode": "percentage",
-                    "value": 0.10
-                },
-
-                "5": {
-                    "mode": "character_offset",
-                    "value": 30
-                },
-
-                "10": {
-                    "mode": "end"
-                }
+                "2": {"mode": "beginning"},
+                "5": {"mode": "end"}
             }
         }
+    ],
 
-        # Add more target dictionaries here, separated by commas.
-    ]
+    # Optional external dataset sampling.
+    #
+    # Set "targets": [] above and replace None with:
+    #
+    # {
+    #     "dataset": "oskarvanderwal/bbq",
+    #     "config": "All",
+    #     "split": "test",
+    #     "revision": None,
+    #     "fields": ["context", "question"],
+    #     "join_with": "\n",
+    #     "count": 20,
+    #     "pool_size": 500,
+    #
+    #     "extract": {
+    #         "mode": "random_characters",
+    #         "length": 100
+    #     },
+    #
+    #     "selection": {
+    #         "mode": "random",
+    #         "frequency": 5,
+    #         "stage": "all"
+    #     },
+    #
+    #     "position": {
+    #         "mode": "token_fraction",
+    #         "fraction": 0.5
+    #     },
+    #
+    #     "per_target": {
+    #         "0": {
+    #             "selection": {
+    #                 "mode": "explicit",
+    #                 "source_ids": [2, 5]
+    #             }
+    #         }
+    #     }
+    # }
+
+    "sample_external": None
 }
 
 
 # ============================================================
-# 2. VALIDATION HELPERS
+# 2. GENERAL HELPERS
 # ============================================================
 
-def integer(value, name, minimum=0):
-    """
-    Require an integer greater than or equal to minimum.
-
-    Boolean values are rejected even though bool is a
-    subclass of int in Python.
-    """
+def whole(value, label, minimum=0):
+    """Require an integer >= minimum."""
 
     if type(value) is not int or value < minimum:
         raise ValueError(
-            f"{name} must be an integer >= {minimum}, "
-            f"got {value!r}"
+            f"{label} must be an integer >= {minimum}"
         )
 
     return value
 
 
-def fraction(value, name):
-    """
-    Validate a numeric fraction in the inclusive range [0, 1].
-    """
+def frac(value, label):
+    """Require a finite fraction in [0, 1]."""
 
     if (
         type(value) not in (int, float)
+        or not math.isfinite(value)
         or not 0 <= value <= 1
     ):
         raise ValueError(
-            f"{name} must be numeric between 0 and 1"
+            f"{label} must be a finite fraction in [0, 1]"
         )
 
     return float(value)
 
 
-def sha(text):
-    """
-    Return the SHA-256 checksum of UTF-8 encoded text.
-
-    Checksums help identify the exact original and modified
-    document contents used in an experiment.
-    """
+def sha(value):
+    """SHA-256 hash of UTF-8 encoded text."""
 
     return hashlib.sha256(
-        text.encode("utf-8")
+        value.encode("utf-8")
     ).hexdigest()
 
 
 # ============================================================
-# 3. STREAM HUGGING FACE DATASETS
+# 3. HUGGING FACE DATASET STREAMING
 # ============================================================
 
-def hf_iterator(
-    dataset,
+def stream_dataset(
+    name,
     split="train",
     config=None,
     revision=None
 ):
     """
-    Create a streaming iterator for a Hugging Face dataset.
+    Open a Hugging Face dataset as an ordered stream.
 
-    Streaming avoids loading the entire Pile into memory.
-
-    Rows are read sequentially without explicit shuffling.
+    No explicit shuffling is performed.
     """
 
     from datasets import load_dataset
 
-    kwargs = {
-        "path": dataset,
+    options = {
+        "path": name,
         "split": split,
         "streaming": True
     }
 
     if config is not None:
-        kwargs["name"] = config
+        options["name"] = config
 
     if revision is not None:
-        kwargs["revision"] = revision
+        options["revision"] = revision
 
-    return iter(load_dataset(**kwargs))
+    return iter(load_dataset(**options))
 
 
 # ============================================================
-# 4. LOAD SELECTED ORIGINAL PILE DOCUMENTS
+# 4. LOAD ORIGINAL PILE DOCUMENTS
 # ============================================================
 
-def load_hosts(cfg):
+def source_ids_for_take(take):
     """
-    Load the original Pile documents specified by cfg["take"].
+    Determine which original Pile source IDs to load.
 
-    Returns a list of:
-        {
-            "source_id": original Pile row index,
-            "original_text": original document content
-        }
-
-    Source ordering is preserved.
+    Modes:
+        first_n
+        source_ids
+        source_range
     """
 
-    take = cfg["take"]
     mode = take["mode"]
 
-    # Determine which original source IDs must be retained.
     if mode == "first_n":
 
-        n = integer(take["n"], "take.n", 1)
-        requested = set(range(n))
+        ids = list(
+            range(
+                whole(take["n"], "take.n", 1)
+            )
+        )
 
     elif mode == "source_ids":
 
-        values = take["ids"]
-
-        requested = {
-            integer(i, "take.ids entry")
-            for i in values
-        }
-
-        if not values or len(requested) != len(values):
-            raise ValueError(
-                "take.ids must contain distinct source IDs"
-            )
+        ids = [
+            whole(i, "source ID")
+            for i in take["ids"]
+        ]
 
     elif mode == "source_range":
 
-        start = integer(take["start"], "take.start")
+        start = whole(
+            take["start"],
+            "start"
+        )
 
-        stop = integer(
+        stop = whole(
             take["stop"],
-            "take.stop",
+            "stop",
             start + 1
         )
 
-        requested = set(range(start, stop))
+        ids = list(range(start, stop))
 
     else:
         raise ValueError(
             f"Unknown take mode: {mode}"
         )
 
-    rows = hf_iterator(
-        cfg["dataset"],
-        cfg.get("split", "train"),
-        cfg.get("dataset_config"),
-        cfg.get("dataset_revision")
+    if not ids or len(set(ids)) != len(ids):
+        raise ValueError(
+            "Source IDs must be nonempty and unique"
+        )
+
+    return sorted(ids)
+
+
+def load_hosts(pile):
+    """
+    Load existing Pile documents.
+
+    Source IDs refer to original zero-based stream indices.
+    Original ordering is preserved.
+    """
+
+    ids = source_ids_for_take(
+        pile["take"]
+    )
+
+    desired = set(ids)
+
+    rows = stream_dataset(
+        pile["name"],
+        pile.get("split", "train"),
+        pile.get("config"),
+        pile.get("revision")
     )
 
     hosts = []
 
-    # Only stream through the largest requested source ID.
-    #
-    # Example:
-    # Requested IDs = {2, 5, 10}
-    #
-    # Read rows 0 through 10, retaining only 2, 5, and 10.
     for idx, row in enumerate(
-        islice(rows, max(requested) + 1)
+        islice(rows, ids[-1] + 1)
     ):
 
-        if idx not in requested:
+        if idx not in desired:
             continue
 
-        text = row.get("text")
+        value = row.get("text")
 
-        if not isinstance(text, str):
+        if not isinstance(value, str):
             raise ValueError(
-                f"Pile row {idx} has no string text field"
+                f"Host {idx} has no string text field"
             )
 
         hosts.append({
             "source_id": idx,
-            "original_text": text
+            "text": value
         })
 
-    # Ensure the requested source rows actually existed.
-    if len(hosts) != len(requested):
+    if len(hosts) != len(ids):
         raise ValueError(
-            f"Requested {len(requested)} host rows, "
-            f"but found {len(hosts)}"
+            "Some requested source documents "
+            "were unavailable"
         )
 
     return hosts
 
 
 # ============================================================
-# 5. LOAD TARGET TEXT
+# 5. EXTERNAL DATASET TEXT EXTRACTION
 # ============================================================
 
-def load_span(source):
+def read_fields(
+    row,
+    fields,
+    join_with="\n"
+):
     """
-    Resolve a target span from literal text or an external
-    Hugging Face dataset.
+    Extract one or multiple fields from an external row.
 
-    For an external dataset, only the selected text span
-    is extracted and inserted into existing Pile hosts.
+    Examples:
+        ["text"]
+        ["context", "question"]
+    """
+
+    if isinstance(fields, str):
+        fields = [fields]
+
+    if (
+        not isinstance(fields, list)
+        or not fields
+        or not isinstance(join_with, str)
+    ):
+        raise ValueError(
+            "Invalid fields or join_with"
+        )
+
+    values = [
+        row.get(field)
+        for field in fields
+    ]
+
+    if any(
+        not isinstance(v, str) or not v.strip()
+        for v in values
+    ):
+        raise ValueError(
+            f"Missing or empty string field in {fields}"
+        )
+
+    return join_with.join(values)
+
+
+# ============================================================
+# 6. MODEL-INDEPENDENT TOKENIZER INTERFACE
+# ============================================================
+
+def token_map(text, tokenizer):
+    """
+    Tokenize with the caller-supplied tokenizer.
+
+    Compatible tokenizer requirements:
+        - is_fast == True
+        - Supports return_offsets_mapping
+        - Returns character offsets
+
+    Returns:
+        offsets:
+            List of (start_char, end_char)
+
+        boundaries:
+            N+1 potential insertion boundaries
+            for N original tokens
+
+    Boundary policy:
+        - Adjacent offsets: after preceding token
+        - Whitespace gap: after preceding token
+        - Overlapping offsets: boundary unavailable
+
+    Example:
+        text = "Hello world."
+
+        offsets = [
+            (0, 5),
+            (6, 11),
+            (11, 12)
+        ]
+
+        boundaries = [
+            0, 5, 11, 12
+        ]
+
+    Empty text:
+        offsets = []
+        boundaries = [0]
+    """
+
+    if (
+        tokenizer is None
+        or not getattr(tokenizer, "is_fast", False)
+    ):
+        raise ValueError(
+            "Token operations require a fast tokenizer "
+            "passed as an argument"
+        )
+
+    encoded = tokenizer(
+        text,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+        truncation=False
+    )
+
+    offsets = [
+        tuple(pair)
+        for pair in encoded["offset_mapping"]
+    ]
+
+    if not offsets:
+
+        if text and not text.isspace():
+            raise ValueError(
+                "Tokenizer returned no offsets "
+                "for non-whitespace text"
+            )
+
+        return [], [0]
+
+    if any(
+        start < 0
+        or end < start
+        or end > len(text)
+        for start, end in offsets
+    ):
+        raise ValueError(
+            "Tokenizer returned invalid offsets"
+        )
+
+    boundaries = [0]
+
+    for left, right in zip(
+        offsets,
+        offsets[1:]
+    ):
+
+        previous_end = left[1]
+        next_start = right[0]
+
+        if previous_end <= next_start:
+
+            # Allow gaps between token offsets.
+            boundaries.append(previous_end)
+
+        else:
+
+            # Overlapping token offsets.
+            boundaries.append(None)
+
+    boundaries.append(len(text))
+
+    return offsets, boundaries
+
+
+# ============================================================
+# 7. EXTRACT A PASSAGE FROM SOURCE TEXT
+# ============================================================
+
+def extract_passage(
+    text,
+    specification,
+    tokenizer,
+    rng
+):
+    """
+    Passage extraction modes:
+
+        all
+        characters
+        random_characters
+        tokens
+        random_tokens
+
+    Token passage lengths are based on the original
+    source document's tokenization.
+    """
+
+    if not isinstance(text, str) or not text:
+        raise ValueError(
+            "Source text is empty"
+        )
+
+    specification = (
+        specification or {"mode": "all"}
+    )
+
+    mode = specification.get(
+        "mode", "all"
+    )
+
+    if mode == "all":
+
+        start = 0
+        end = len(text)
+
+    elif mode in (
+        "characters",
+        "random_characters"
+    ):
+
+        length = whole(
+            specification["length"],
+            "character passage length",
+            1
+        )
+
+        if length > len(text):
+            raise ValueError(
+                "Source text is shorter "
+                "than requested passage"
+            )
+
+        if mode == "characters":
+
+            start = whole(
+                specification["start"],
+                "passage start"
+            )
+
+        else:
+
+            start = rng.randrange(
+                len(text) - length + 1
+            )
+
+        end = start + length
+
+    elif mode in (
+        "tokens",
+        "random_tokens"
+    ):
+
+        length = whole(
+            specification["length"],
+            "token passage length",
+            1
+        )
+
+        offsets, boundaries = token_map(
+            text,
+            tokenizer
+        )
+
+        if length > len(offsets):
+            raise ValueError(
+                "Source has insufficient tokens"
+            )
+
+        valid_starts = [
+            i
+            for i in range(
+                len(offsets) - length + 1
+            )
+            if (
+                boundaries[i] is not None
+                and boundaries[i + length] is not None
+                and boundaries[i] < boundaries[i + length]
+            )
+        ]
+
+        if not valid_starts:
+            raise ValueError(
+                "No eligible source token passage"
+            )
+
+        if mode == "tokens":
+
+            token_index = whole(
+                specification["start"],
+                "token passage start"
+            )
+
+        else:
+
+            token_index = rng.choice(
+                valid_starts
+            )
+
+        if token_index not in valid_starts:
+            raise ValueError(
+                "Requested token passage has "
+                "an unavailable boundary"
+            )
+
+        start = boundaries[token_index]
+        end = boundaries[token_index + length]
+
+    else:
+        raise ValueError(
+            f"Unknown passage extraction mode: {mode}"
+        )
+
+    if not 0 <= start < end <= len(text):
+        raise ValueError(
+            "Invalid passage extraction range"
+        )
+
+    return text[start:end], {
+        "mode": mode,
+        "start_char": start,
+        "end_char": end
+    }
+
+
+# ============================================================
+# 8. LOAD AN INDIVIDUAL TARGET SPAN
+# ============================================================
+
+def get_span(
+    source,
+    tokenizer,
+    rng
+):
+    """
+    Source modes:
+        literal
+        hf
+
+    The source may optionally contain an extract
+    configuration specifying an arbitrary passage.
     """
 
     mode = source["mode"]
 
     if mode == "literal":
 
-        span = source["text"]
+        full = source["text"]
+
+        provenance = {
+            "mode": "literal"
+        }
 
     elif mode == "hf":
 
-        idx = integer(
+        row_id = whole(
             source["index"],
-            "source.index"
+            "external row index"
         )
 
-        rows = hf_iterator(
+        rows = stream_dataset(
             source["dataset"],
             source.get("split", "train"),
-            source.get("dataset_config"),
+            source.get("config"),
             source.get("revision")
         )
 
-        # Skip to the requested external dataset row.
         row = next(
-            islice(rows, idx, idx + 1),
+            islice(rows, row_id, row_id + 1),
             None
         )
 
         if row is None:
             raise ValueError(
-                f"No row {idx} found in target dataset"
+                f"External row {row_id} not found"
             )
 
-        span = row.get(source["field"])
+        full = read_fields(
+            row,
+            source.get("fields", "text"),
+            source.get("join_with", "\n")
+        )
 
-        if not isinstance(span, str):
-            raise ValueError(
-                "Chosen external source field "
-                "does not contain text"
+        provenance = {
+            "mode": "hf",
+            "dataset": source["dataset"],
+            "config": source.get("config"),
+            "revision": source.get("revision"),
+            "split": source.get(
+                "split", "train"
+            ),
+            "row": row_id,
+            "fields": source.get(
+                "fields", "text"
             )
-
-        # Optional character-level extraction.
-        start = source.get("slice_start")
-        end = source.get("slice_end")
-
-        if start is not None:
-            integer(start, "slice_start")
-
-        if end is not None:
-            integer(end, "slice_end")
-
-        span = span[start:end]
+        }
 
     else:
         raise ValueError(
-            f"Unknown span source mode: {mode}"
+            f"Unknown target source mode: {mode}"
         )
 
-    if not isinstance(span, str) or not span:
+    span, extraction = extract_passage(
+        full,
+        source.get("extract"),
+        tokenizer,
+        rng
+    )
+
+    provenance.update({
+        "extraction": extraction,
+        "sha256": sha(span)
+    })
+
+    return span, provenance
+
+
+# ============================================================
+# 9. AUTOMATIC EXTERNAL TARGET SAMPLING
+# ============================================================
+
+def sample_targets(
+    specification,
+    tokenizer,
+    rng
+):
+    """
+    Sample multiple unique passages from an external dataset.
+
+    per_target allows individual overrides of:
+        selection
+        position
+        per_document_positions
+    """
+
+    count = whole(
+        specification["count"],
+        "sample count",
+        1
+    )
+
+    pool = whole(
+        specification["pool_size"],
+        "pool size",
+        count
+    )
+
+    rows = list(
+        islice(
+            stream_dataset(
+                specification["dataset"],
+                specification.get(
+                    "split", "train"
+                ),
+                specification.get("config"),
+                specification.get("revision")
+            ),
+            pool
+        )
+    )
+
+    indices = list(range(len(rows)))
+    rng.shuffle(indices)
+
+    targets = []
+    seen = set()
+
+    for row_id in indices:
+
+        try:
+
+            full = read_fields(
+                rows[row_id],
+                specification.get(
+                    "fields", "text"
+                ),
+                specification.get(
+                    "join_with", "\n"
+                )
+            )
+
+            passage, extraction = extract_passage(
+                full,
+                specification.get("extract"),
+                tokenizer,
+                rng
+            )
+
+        except ValueError:
+            continue
+
+        if passage in seen:
+            continue
+
+        seen.add(passage)
+
+        sequence = len(targets)
+
+        overrides = specification.get(
+            "per_target", {}
+        ).get(
+            str(sequence), {}
+        )
+
+        targets.append({
+            "id": f"sample_{sequence}_{row_id}",
+
+            "source": {
+                "mode": "literal",
+                "text": passage
+            },
+
+            "provenance": {
+                "dataset": specification["dataset"],
+                "config": specification.get("config"),
+                "revision": specification.get("revision"),
+                "split": specification.get(
+                    "split", "train"
+                ),
+                "row": row_id,
+                "fields": specification.get(
+                    "fields", "text"
+                ),
+                "extraction": extraction,
+                "sha256": sha(passage)
+            },
+
+            "selection": copy.deepcopy(
+                overrides.get(
+                    "selection",
+                    specification["selection"]
+                )
+            ),
+
+            "position": copy.deepcopy(
+                overrides.get(
+                    "position",
+                    specification["position"]
+                )
+            ),
+
+            "per_document_positions": copy.deepcopy(
+                overrides.get(
+                    "per_document_positions",
+                    specification.get(
+                        "per_document_positions", {}
+                    )
+                )
+            )
+        })
+
+        if len(targets) == count:
+            break
+
+    if len(targets) != count:
         raise ValueError(
-            "Target span must be nonempty text"
+            f"Only {len(targets)} unique usable "
+            f"passages found; requested {count}"
         )
 
-    return span
+    return targets
 
 
 # ============================================================
-# 6. DATASET REGION SELECTION
+# 10. DATASET REGION SELECTION
 # ============================================================
 
-def stage_positions(selection, total):
+def region(
+    selection,
+    total
+):
     """
-    Return eligible output indices for a dataset region.
+    Select a region within the loaded document pool.
 
-    early/middle/late divide the LOADED document sequence
-    into three consecutive regions.
-
-    They do not represent actual training update steps.
+    Stages:
+        all
+        early
+        middle
+        late
+        custom
     """
 
-    stage = selection.get("stage", "all")
+    stage = selection.get(
+        "stage", "all"
+    )
 
     bounds = {
-
-        "all": (
-            0,
-            total
-        ),
+        "all": (0, total),
 
         "early": (
             0,
@@ -656,148 +932,149 @@ def stage_positions(selection, total):
 
     if stage == "custom":
 
-        a = fraction(
-            selection["start_fraction"],
-            "start_fraction"
-        )
-
-        b = fraction(
-            selection["end_fraction"],
-            "end_fraction"
-        )
-
-        if a >= b:
-            raise ValueError(
-                "start_fraction must be less than end_fraction"
-            )
-
-        return list(
-            range(
-                int(a * total),
-                int(b * total)
+        start = int(
+            total * frac(
+                selection["start_fraction"],
+                "start_fraction"
             )
         )
 
-    if stage not in bounds:
+        end = int(
+            total * frac(
+                selection["end_fraction"],
+                "end_fraction"
+            )
+        )
+
+    elif stage in bounds:
+
+        start, end = bounds[stage]
+
+    else:
         raise ValueError(
-            f"Unknown stage: {stage}"
+            f"Unknown dataset stage: {stage}"
         )
 
-    return list(range(*bounds[stage]))
+    if not 0 <= start < end <= total:
+        raise ValueError(
+            "Dataset region is invalid or empty"
+        )
+
+    return list(range(start, end))
 
 
 # ============================================================
-# 7. CHOOSE HOST DOCUMENTS FOR A TARGET
+# 11. SELECT HOST DOCUMENTS
 # ============================================================
 
-def choose_hosts(selection, hosts, span, rng):
+def choose_hosts(
+    selection,
+    hosts,
+    span,
+    rng
+):
     """
-    Select distinct host documents receiving a target.
+    Host selection modes:
+        explicit
+        random
+        range
+        every_n
 
-    Frequency is the number of DISTINCT selected hosts.
+    Frequency refers to distinct scheduled host documents.
 
-    Explicit mode uses original Pile source IDs.
-    Range/every_n modes use loaded output indices.
-
-    Hosts already containing the exact target substring
-    are rejected or excluded to prevent preexisting target
-    occurrences from distorting frequency measurements.
+    Explicit IDs use original dataset source IDs.
+    Other modes use loaded output indices.
     """
 
-    mode = selection["mode"]
     total = len(hosts)
+    mode = selection["mode"]
 
-    # Original source ID -> loaded output index.
     lookup = {
         host["source_id"]: i
         for i, host in enumerate(hosts)
     }
 
-    # --------------------------------------------------------
-    # EXPLICIT SOURCE IDS
-    # --------------------------------------------------------
-
     if mode == "explicit":
 
-        ids = selection["source_ids"]
+        source_ids = [
+            whole(x, "source ID")
+            for x in selection["source_ids"]
+        ]
 
-        for x in ids:
-            integer(x, "selection source ID")
-
-        if len(set(ids)) != len(ids):
+        if (
+            len(source_ids) != len(set(source_ids))
+            or any(
+                x not in lookup
+                for x in source_ids
+            )
+        ):
             raise ValueError(
-                "Duplicate explicit source IDs"
+                "Explicit IDs must be distinct and loaded"
             )
 
-        if any(x not in lookup for x in ids):
-            raise ValueError(
-                "Explicit selection includes unloaded "
-                "Pile source IDs"
-            )
-
-        chosen = [lookup[x] for x in ids]
+        selected = [
+            lookup[x]
+            for x in source_ids
+        ]
 
     else:
 
-        frequency = integer(
+        frequency = whole(
             selection["frequency"],
             "frequency"
         )
 
-        # ----------------------------------------------------
-        # RANDOM SELECTION FROM A STAGE
-        # ----------------------------------------------------
-
         if mode == "random":
 
-            candidates = stage_positions(
+            candidates = region(
                 selection,
                 total
             )
 
-        # ----------------------------------------------------
-        # RANDOM SELECTION FROM A FIXED INDEX RANGE
-        # ----------------------------------------------------
-
         elif mode == "range":
 
-            a = integer(
+            start = whole(
                 selection["start_output_index"],
                 "range start"
             )
 
-            b = integer(
+            end = whole(
                 selection["stop_output_index"],
                 "range stop",
-                a + 1
+                start + 1
             )
 
-            if b > total:
+            if end > total:
                 raise ValueError(
-                    "Range exceeds number of loaded documents"
+                    "Range exceeds loaded documents"
                 )
 
-            candidates = list(range(a, b))
-
-        # ----------------------------------------------------
-        # EVERY NTH DOCUMENT
-        # ----------------------------------------------------
+            candidates = list(
+                range(start, end)
+            )
 
         elif mode == "every_n":
 
-            a = integer(
-                selection.get("start_output_index", 0),
+            start = whole(
+                selection.get(
+                    "start_output_index", 0
+                ),
                 "every_n start"
             )
 
-            every = integer(
+            step = whole(
                 selection["every_n"],
                 "every_n",
                 1
             )
 
+            if start >= total:
+                raise ValueError(
+                    "Every-N start exceeds dataset length"
+                )
+
             candidates = list(
-                range(a, total, every)
+                range(start, total, step)
             )
 
         else:
@@ -805,563 +1082,693 @@ def choose_hosts(selection, hosts, span, rng):
                 f"Unknown selection mode: {mode}"
             )
 
-        # Remove candidate hosts already containing the target.
-        #
-        # For example, if "my name is apratim" already
-        # occurs in a host, it is not eligible for another
-        # controlled occurrence of that target.
-        candidates = [
-            i for i in candidates
-            if span not in hosts[i]["original_text"]
-        ]
+        if mode == "every_n":
 
-        if frequency > len(candidates):
-            raise ValueError(
-                f"Frequency {frequency} exceeds "
-                f"{len(candidates)} eligible hosts"
-            )
+            if frequency > len(candidates):
+                raise ValueError(
+                    "Not enough documents at "
+                    "the requested interval"
+                )
 
-        if mode in ("random", "range"):
-
-            # Sampling without replacement ensures
-            # distinct host documents.
-            chosen = rng.sample(
-                candidates,
-                frequency
-            )
+            selected = candidates[:frequency]
 
         else:
 
-            # Every-N selection retains deterministic order.
-            chosen = candidates[:frequency]
+            eligible = [
+                i
+                for i in candidates
+                if span not in hosts[i]["text"]
+            ]
 
-    # Explicit selections must also reject preexisting spans.
-    for i in chosen:
-
-        if span in hosts[i]["original_text"]:
-            raise ValueError(
-                "Target already appears in original "
-                f"host {hosts[i]['source_id']}"
-            )
-
-    return sorted(chosen)
-
-
-# ============================================================
-# 8. TOKENIZER-BASED POSITION SUPPORT
-# ============================================================
-
-class TokenOffsets:
-    """
-    Convert original token boundaries into character offsets.
-
-    A fast tokenizer provides offset_mapping, describing
-    where each token lies in the original character string.
-
-    An N-token document has N+1 conceptual boundaries:
-        0 -> before first token
-        N -> after final token
-
-    Interior overlapping offsets are rejected because
-    they cannot be represented as unambiguous boundaries.
-
-    Tokenization of the modified document can differ from
-    tokenization of the original document.
-    """
-
-    def __init__(self, cfg):
-
-        self.cfg = cfg
-        self.tokenizer = None
-
-    def boundaries(self, text):
-        """
-        Return character offsets for token boundaries.
-
-        None indicates an ambiguous overlapping boundary.
-        """
-
-        # Lazily initialize the tokenizer.
-        if self.tokenizer is None:
-
-            from transformers import AutoTokenizer
-
-            kwargs = {
-                "use_fast": True
-            }
-
-            if self.cfg.get("tokenizer_revision"):
-                kwargs["revision"] = (
-                    self.cfg["tokenizer_revision"]
-                )
-
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.cfg["tokenizer"],
-                **kwargs
-            )
-
-            if not self.tokenizer.is_fast:
+            if frequency > len(eligible):
                 raise ValueError(
-                    "Tokenizer must be fast and support "
-                    "offset_mapping"
+                    "Insufficient eligible host documents"
                 )
 
-        # Tokenize without adding special tokens or truncating.
-        encoded = self.tokenizer(
-            text,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-            truncation=False
+            selected = rng.sample(
+                eligible,
+                frequency
+            )
+
+    # An existing occurrence is not counted as a new insertion.
+    if any(
+        span in hosts[i]["text"]
+        for i in selected
+    ):
+        raise ValueError(
+            "Selected host already contains target text"
         )
 
-        offsets = encoded["offset_mapping"]
-
-        # Beginning of original document.
-        result = [0]
-
-        for k in range(1, len(offsets)):
-
-            prev_end = offsets[k - 1][1]
-            next_start = offsets[k][0]
-
-            if prev_end > next_start:
-
-                # Overlapping offsets are ambiguous.
-                result.append(None)
-
-            else:
-
-                # Boundary derived from preceding token end.
-                result.append(prev_end)
-
-        # End of original document.
-        result.append(len(text))
-
-        return result
+    return sorted(selected)
 
 
 # ============================================================
-# 9. RESOLVE A WITHIN-DOCUMENT INSERTION OFFSET
+# 12. POSITION WITHIN ORIGINAL DOCUMENT
 # ============================================================
 
 def position_offset(
     text,
     specification,
-    rng,
-    token_helper
+    tokenizer,
+    rng
 ):
     """
-    Convert a position specification into a character offset
-    within the ORIGINAL document.
+    Resolve position to a character offset in ORIGINAL text.
 
-    Supported modes:
+    Character modes:
         beginning
         middle
         end
-        percentage
         character_offset
+        character_fraction
+        percentage
         random_character
-        token_offset
-        random_token
-        token_percentage
 
-    All returned offsets are original-text character indices.
+    Token modes:
+        token_offset
+        token_fraction
+        token_percentage
+        random_token
+
+    Delimiter modes:
+        character_fraction_delimiter
+        token_fraction_delimiter
+
+    The tokenizer is always supplied by the caller.
     """
 
     mode = specification["mode"]
-    length = len(text)
+    text_length = len(text)
+
+    info = {
+        "mode": mode
+    }
+
+    boundaries = None
 
     # --------------------------------------------------------
-    # DOCUMENT BEGINNING
+    # CHARACTER-BASED POSITIONS
     # --------------------------------------------------------
 
     if mode == "beginning":
-        return 0
 
-    # --------------------------------------------------------
-    # DOCUMENT MIDDLE (CHARACTER-BASED)
-    # --------------------------------------------------------
+        offset = 0
 
-    if mode == "middle":
-        return length // 2
+    elif mode == "middle":
 
-    # --------------------------------------------------------
-    # DOCUMENT END
-    # --------------------------------------------------------
+        offset = text_length // 2
 
-    if mode == "end":
-        return length
+    elif mode == "end":
 
-    # --------------------------------------------------------
-    # RANDOM CHARACTER BOUNDARY
-    # --------------------------------------------------------
-    #
-    # Includes both the beginning and end of the document.
+        offset = text_length
 
-    if mode == "random_character":
-        return rng.randint(0, length)
+    elif mode == "character_offset":
 
-    # --------------------------------------------------------
-    # FRACTION OF ORIGINAL CHARACTER LENGTH
-    # --------------------------------------------------------
-
-    if mode == "percentage":
-
-        value = fraction(
+        offset = whole(
             specification["value"],
-            "percentage"
+            "character offset"
         )
 
-        # This can produce an offset inside a word.
-        return round(length * value)
+    elif mode == "random_character":
 
-    # --------------------------------------------------------
-    # EXACT CHARACTER OFFSET
-    # --------------------------------------------------------
-
-    if mode == "character_offset":
-
-        offset = integer(
-            specification["value"],
-            "character_offset"
+        offset = rng.randint(
+            0, text_length
         )
 
-        if offset > length:
-            raise ValueError(
-                f"Character offset {offset} exceeds "
-                f"document length {length}"
-            )
+    elif mode in (
+        "character_fraction",
+        "percentage",
+        "character_fraction_delimiter"
+    ):
 
-        return offset
+        value = frac(
+            specification.get(
+                "fraction",
+                specification.get("value")
+            ),
+            "character fraction"
+        )
+
+        offset = round(
+            text_length * value
+        )
+
+        info["requested_fraction"] = value
 
     # --------------------------------------------------------
     # TOKEN-BASED POSITIONS
     # --------------------------------------------------------
 
-    if mode in (
+    elif mode in (
         "token_offset",
+        "token_fraction",
+        "token_percentage",
         "random_token",
-        "token_percentage"
+        "token_fraction_delimiter"
     ):
 
-        boundaries = token_helper.boundaries(text)
+        offsets, boundaries = token_map(
+            text,
+            tokenizer
+        )
 
-        token_count = len(boundaries) - 1
+        token_count = len(offsets)
 
         if mode == "token_offset":
 
-            k = integer(
+            token_index = whole(
                 specification["value"],
-                "token_offset"
+                "token offset"
             )
 
-        elif mode == "token_percentage":
+        elif mode == "random_token":
 
-            value = fraction(
-                specification["value"],
-                "token_percentage"
+            available = [
+                i
+                for i, boundary in enumerate(boundaries)
+                if boundary is not None
+            ]
+
+            token_index = rng.choice(
+                available
             )
-
-            k = round(token_count * value)
 
         else:
 
-            # Only choose valid, non-overlapping boundaries.
-            valid = [
-                k
-                for k, value in enumerate(boundaries)
-                if value is not None
-            ]
-
-            k = rng.choice(valid)
-
-        if k > token_count:
-            raise ValueError(
-                f"Token offset {k} exceeds original "
-                f"token count {token_count}"
+            value = frac(
+                specification.get(
+                    "fraction",
+                    specification.get("value")
+                ),
+                "token fraction"
             )
 
-        if boundaries[k] is None:
-            raise ValueError(
-                f"Token boundary {k} overlaps in tokenizer "
-                "offset mapping; choose another boundary"
+            token_index = round(
+                token_count * value
             )
 
-        return boundaries[k]
+            info["requested_fraction"] = value
 
-    raise ValueError(
-        f"Unknown position mode: {mode}"
-    )
+        if token_index > token_count:
+            raise ValueError(
+                f"Token boundary {token_index} "
+                f"exceeds {token_count} tokens"
+            )
+
+        info.update({
+            "original_token_count": token_count,
+            "requested_token_boundary": token_index
+        })
+
+        if boundaries[token_index] is None:
+
+            if mode != "token_fraction_delimiter":
+                raise ValueError(
+                    f"Token boundary {token_index} "
+                    "overlaps; exact insertion unavailable"
+                )
+
+            # Delimiter alignment may search forward
+            # even when the requested boundary overlaps.
+            offset = offsets[token_index - 1][1]
+
+            info["requested_boundary_overlaps"] = True
+
+        else:
+
+            offset = boundaries[token_index]
+
+            info["requested_boundary_overlaps"] = False
+
+    else:
+        raise ValueError(
+            f"Unknown insertion position mode: {mode}"
+        )
+
+    if offset > text_length:
+        raise ValueError(
+            "Insertion position exceeds document length"
+        )
+
+    info["requested_character_offset"] = offset
+
+    # --------------------------------------------------------
+    # DELIMITER ALIGNMENT
+    # --------------------------------------------------------
+
+    if mode.endswith("_delimiter"):
+
+        delimiters = specification.get(
+            "delimiters"
+        )
+
+        if (
+            not isinstance(delimiters, list)
+            or not delimiters
+            or any(
+                not isinstance(d, str) or not d
+                for d in delimiters
+            )
+        ):
+            raise ValueError(
+                "delimiters must be a nonempty list "
+                "of nonempty strings"
+            )
+
+        # Character mode allows any matching delimiter.
+        # Token mode requires its end to be a valid
+        # original-token boundary.
+        allowed_boundaries = (
+            None
+            if boundaries is None
+            else {
+                boundary
+                for boundary in boundaries
+                if boundary is not None
+            }
+        )
+
+        matches = []
+
+        for order, delimiter in enumerate(delimiters):
+
+            start = text.find(
+                delimiter,
+                offset
+            )
+
+            while start >= 0:
+
+                delimiter_end = (
+                    start + len(delimiter)
+                )
+
+                if (
+                    allowed_boundaries is None
+                    or delimiter_end in allowed_boundaries
+                ):
+
+                    matches.append((
+                        start,
+                        order,
+                        delimiter_end,
+                        delimiter
+                    ))
+
+                    break
+
+                start = text.find(
+                    delimiter,
+                    start + 1
+                )
+
+        if matches:
+
+            # Choose the earliest starting delimiter.
+            # List order breaks ties.
+            (
+                found,
+                _,
+                offset,
+                matched_delimiter
+            ) = min(matches)
+
+            info.update({
+                "matched_delimiter": matched_delimiter,
+                "delimiter_start": found
+            })
+
+        else:
+
+            policy = specification.get(
+                "on_missing", "error"
+            )
+
+            if policy == "end":
+
+                offset = text_length
+
+            elif policy == "requested":
+
+                if info.get(
+                    "requested_boundary_overlaps",
+                    False
+                ):
+                    raise ValueError(
+                        "Cannot fall back to an "
+                        "overlapping token boundary"
+                    )
+
+                offset = info[
+                    "requested_character_offset"
+                ]
+
+            elif policy == "error":
+
+                raise ValueError(
+                    "No eligible delimiter found after "
+                    "requested position"
+                )
+
+            else:
+                raise ValueError(
+                    "Invalid on_missing policy"
+                )
+
+            info["delimiter_fallback"] = policy
+
+    info[
+        "actual_original_character_offset"
+    ] = offset
+
+    if boundaries is not None:
+
+        indices = [
+            i
+            for i, boundary in enumerate(boundaries)
+            if boundary == offset
+        ]
+
+        actual_index = (
+            indices[0]
+            if indices
+            else None
+        )
+
+        info["actual_original_token_boundary"] = (
+            actual_index
+        )
+
+        info["actual_original_token_fraction"] = (
+            actual_index / (len(boundaries) - 1)
+            if actual_index is not None
+            and len(boundaries) > 1
+            else None
+        )
+
+    return offset, info
 
 
 # ============================================================
-# 10. MAIN INSERTION ENGINE
+# 13. FINAL MODIFIED TOKEN POSITION
 # ============================================================
 
-def apply_insertions(
-    cfg,
-    hosts,
-    resolved_spans=None
+def final_token_observation(
+    modified_text,
+    records,
+    tokenizer
 ):
     """
-    Apply all configured target insertions.
+    Tokenize each modified document only once.
 
-    PHASE A: PLAN
-        Resolve targets, choose hosts, and compute positions
-        using the ORIGINAL host documents.
+    For every inserted span, record:
+        - Modified token count
+        - Token interval overlapping the inserted characters
+        - First overlapping token fraction
+        - Tokens crossing span boundaries
 
-    PHASE B: APPLY
-        Apply all planned insertions, preserving original text
-        and document ordering.
-
-    PHASE C: VALIDATE
-        Verify recorded span positions, original-text
-        reconstruction, and per-target insertion frequency.
-
-    Multiple targets may share the same host document.
-
-    Returns
-    -------
-    output_documents:
-        Modified and unmodified document records.
-
-    target_info:
-        Target-level experimental metadata.
-
-    insertion_records:
-        Individual insertion records.
+    Token intervals use [start, end).
     """
 
-    rng = random.Random(cfg["seed"])
+    if tokenizer is None:
+        return
 
-    if not hosts:
-        raise ValueError("No hosts")
+    offsets, _ = token_map(
+        modified_text,
+        tokenizer
+    )
 
-    # Verify distinct, ascending original source IDs.
+    token_count = len(offsets)
+
+    for record in records:
+
+        span_start = record[
+            "inserted_start_char"
+        ]
+
+        span_end = record[
+            "inserted_end_char"
+        ]
+
+        overlapping = [
+            i
+            for i, (start, end) in enumerate(offsets)
+            if start < span_end and end > span_start
+        ]
+
+        crossing = [
+            i
+            for i in overlapping
+            if (
+                offsets[i][0] < span_start
+                or offsets[i][1] > span_end
+            )
+        ]
+
+        record["final_token_observation"] = {
+            "modified_token_count": token_count,
+
+            "span_overlapping_token_interval": (
+                [
+                    overlapping[0],
+                    overlapping[-1] + 1
+                ]
+                if overlapping
+                else None
+            ),
+
+            "span_first_token_fraction": (
+                overlapping[0] / token_count
+                if overlapping
+                else None
+            ),
+
+            "boundary_crossing_token_indices": crossing,
+
+            "no_overlapping_tokens": not overlapping
+        }
+
+
+# ============================================================
+# 14. CONTROLLED INSERTION ENGINE
+# ============================================================
+
+def insert_targets(
+    config,
+    hosts,
+    tokenizer=None
+):
+    """
+    Insert all configured targets into existing documents.
+
+    Important:
+        All insertion positions use ORIGINAL document text.
+
+        Multiple targets can share a host and can even
+        share the same original insertion position.
+
+        The tokenizer is supplied by the caller.
+
+    Returns:
+        output_documents
+        target_information
+        insertion_records
+    """
+
+    rng = random.Random(
+        config.get("seed", 42)
+    )
+
     source_ids = [
         host["source_id"]
         for host in hosts
     ]
 
-    if source_ids != sorted(set(source_ids)):
+    if (
+        not hosts
+        or source_ids != sorted(set(source_ids))
+        or any(
+            not isinstance(host["text"], str)
+            for host in hosts
+        )
+    ):
         raise ValueError(
-            "Hosts must have distinct source IDs "
-            "in original Pile order"
+            "Hosts must be sorted, unique, "
+            "and contain string text"
         )
 
-    # Preserve original texts throughout planning.
-    originals = [
-        host["original_text"]
-        for host in hosts
+    targets = copy.deepcopy(
+        config.get("targets", [])
+    )
+
+    # Add automatically sampled external spans.
+    if config.get("sample_external"):
+
+        targets.extend(
+            sample_targets(
+                config["sample_external"],
+                tokenizer,
+                rng
+            )
+        )
+
+    target_ids = [
+        target["id"]
+        for target in targets
     ]
 
-    token_helper = TokenOffsets(cfg)
+    if len(set(target_ids)) != len(target_ids):
+        raise ValueError(
+            "Target IDs must be unique"
+        )
 
-    # Maps output document index -> planned insertions.
     planned = defaultdict(list)
+    target_information = []
+    seen_spans = []
 
-    target_info = []
-    seen_ids = set()
+    # --------------------------------------------------------
+    # A. PLAN ALL INSERTIONS
+    # --------------------------------------------------------
 
-    # ========================================================
-    # PHASE A: PLAN ALL TARGET INSERTIONS
-    # ========================================================
+    for order, target in enumerate(targets):
 
-    for target_index, target in enumerate(cfg["targets"]):
+        span, provenance = get_span(
+            target["source"],
+            tokenizer,
+            rng
+        )
 
-        target_id = target["id"]
-
-        if target_id in seen_ids:
-            raise ValueError(
-                f"Duplicate target ID: {target_id}"
-            )
-
-        seen_ids.add(target_id)
-
-        # ----------------------------------------------------
-        # A1. RESOLVE TARGET TEXT
-        # ----------------------------------------------------
-
-        if (
-            resolved_spans is not None
-            and target_id in resolved_spans
+        # Avoid direct containment between target strings.
+        if any(
+            span in other or other in span
+            for other in seen_spans
         ):
-            span = resolved_spans[target_id]
-
-        else:
-            span = load_span(target["source"])
-
-        if not isinstance(span, str) or not span:
             raise ValueError(
-                "Resolved span must be nonempty"
+                "Configured target strings overlap "
+                "by substring containment"
             )
 
-        # ----------------------------------------------------
-        # A2. SELECT DISTINCT HOST DOCUMENTS
-        # ----------------------------------------------------
+        seen_spans.append(span)
 
-        chosen = choose_hosts(
+        selected_hosts = choose_hosts(
             target["selection"],
             hosts,
             span,
             rng
         )
 
-        # ----------------------------------------------------
-        # A3. RESOLVE EACH HOST'S INSERTION POSITION
-        # ----------------------------------------------------
+        for index in selected_hosts:
 
-        for i in chosen:
+            host = hosts[index]
 
-            host = hosts[i]
-
-            # Document-specific overrides take precedence
-            # over the target's default position.
-            position_spec = target.get(
-                "per_document_positions",
-                {}
+            position = target.get(
+                "per_document_positions", {}
             ).get(
                 str(host["source_id"]),
                 target["position"]
             )
 
-            # Compute offset using original document text.
-            offset = position_offset(
-                originals[i],
-                position_spec,
-                rng,
-                token_helper
+            offset, details = position_offset(
+                host["text"],
+                position,
+                tokenizer,
+                rng
             )
 
-            # Store the insertion rather than applying it
-            # immediately. This prevents earlier insertions
-            # from shifting later original-text offsets.
-            planned[i].append({
-
-                "target_id": target_id,
-
-                "target_order": target_index,
-
+            planned[index].append({
+                "id": target["id"],
                 "span": span,
-
                 "offset": offset,
-
-                "position": position_spec
+                "order": order,
+                "position": details
             })
 
-        # ----------------------------------------------------
-        # A4. RECORD TARGET-LEVEL METADATA
-        # ----------------------------------------------------
-
-        target_info.append({
-
-            "id": target_id,
-
-            "source": target["source"],
-
+        target_information.append({
+            "id": target["id"],
+            "span": span,
             "span_sha256": sha(span),
 
-            "span": span,
+            "source": target.get(
+                "provenance",
+                provenance
+            ),
 
-            "frequency": len(chosen),
+            "frequency": len(selected_hosts),
 
             "host_source_ids": [
-                hosts[i]["source_id"]
-                for i in chosen
+                hosts[index]["source_id"]
+                for index in selected_hosts
             ]
         })
 
-    # ========================================================
-    # PHASE B: APPLY INSERTIONS
-    # ========================================================
+    separator = config.get(
+        "separator",
+        "\n\n"
+    )
+
+    if not isinstance(separator, str):
+        raise ValueError(
+            "separator must be a string"
+        )
 
     output_documents = []
     insertion_records = []
 
-    # Process every host in original dataset order.
-    for i, host in enumerate(hosts):
+    # --------------------------------------------------------
+    # B. APPLY INSERTIONS TO ORIGINAL DOCUMENTS
+    # --------------------------------------------------------
 
-        original_text = originals[i]
+    for index, host in enumerate(hosts):
 
-        # Sort insertions by original character position.
-        #
-        # If two targets share the same offset, their
-        # configuration order breaks the tie.
+        original = host["text"]
+
         placements = sorted(
-            planned[i],
-            key=lambda p: (
-                p["offset"],
-                p["target_order"]
+            planned[index],
+            key=lambda item: (
+                item["offset"],
+                item["order"]
             )
         )
 
-        # Build modified text from fragments to avoid
-        # repeatedly copying the entire document.
         pieces = []
-
-        # Position already consumed in ORIGINAL text.
-        cursor = 0
-
-        # Number of characters already emitted in output.
-        output_length = 0
-
-        # Records for insertions into this particular host.
         own_records = []
+
+        cursor = 0
+        emitted = 0
 
         for placement in placements:
 
             offset = placement["offset"]
 
-            # ------------------------------------------------
-            # B1. COPY ORIGINAL TEXT BEFORE INSERTION
-            # ------------------------------------------------
-
-            segment = original_text[cursor:offset]
+            # Preserve untouched original text.
+            segment = original[
+                cursor:offset
+            ]
 
             pieces.append(segment)
-            output_length += len(segment)
+            emitted += len(segment)
 
-            # ------------------------------------------------
-            # B2. ADD INSERTION SEPARATORS
-            # ------------------------------------------------
-            #
-            # Separate target text from the original context.
-            #
-            # No left separator at document beginning.
-            # No right separator at original document end.
-            #
-            # Separators are additional text and are recorded
-            # separately for exact reconstruction.
             left_separator = (
-                "\n\n"
+                separator
                 if offset > 0
                 else ""
             )
 
             right_separator = (
-                "\n\n"
-                if offset < len(original_text)
+                separator
+                if offset < len(original)
                 else ""
             )
 
-            # ------------------------------------------------
-            # B3. CALCULATE TARGET OFFSETS IN MODIFIED TEXT
-            # ------------------------------------------------
-            #
-            # start is inclusive; end is exclusive.
             span_start = (
-                output_length
-                + len(left_separator)
+                emitted + len(left_separator)
             )
 
             span_end = (
-                span_start
-                + len(placement["span"])
+                span_start + len(
+                    placement["span"]
+                )
             )
-
-            # ------------------------------------------------
-            # B4. APPEND INSERTED CONTENT
-            # ------------------------------------------------
 
             pieces.extend((
                 left_separator,
@@ -1369,316 +1776,193 @@ def apply_insertions(
                 right_separator
             ))
 
-            output_length += (
+            emitted += (
                 len(left_separator)
                 + len(placement["span"])
                 + len(right_separator)
             )
 
-            # ------------------------------------------------
-            # B5. SAVE INSERTION DETAILS
-            # ------------------------------------------------
-
-            record = {
-
-                "target_id": placement["target_id"],
+            own_records.append({
+                "target_id": placement["id"],
 
                 "pile_source_id": host["source_id"],
-
-                "output_document_index": i,
-
-                "position_spec": placement["position"],
+                "output_document_index": index,
 
                 "original_character_offset": offset,
 
                 "inserted_start_char": span_start,
-
                 "inserted_end_char": span_end,
 
                 "left_separator": left_separator,
-
                 "right_separator": right_separator,
 
-                "inserted_span": placement["span"]
-            }
+                "inserted_span": placement["span"],
+                "position": placement["position"]
+            })
 
-            own_records.append(record)
-
-            # Advance through original text only.
             cursor = offset
 
-        # ----------------------------------------------------
-        # B6. APPEND REMAINING ORIGINAL TEXT
-        # ----------------------------------------------------
+        pieces.append(
+            original[cursor:]
+        )
 
-        pieces.append(original_text[cursor:])
+        modified = "".join(pieces)
 
-        modified_text = "".join(pieces)
+        # Record original and final token observations.
+        if own_records and tokenizer is not None:
 
-        # ====================================================
-        # PHASE C: VERIFY ORIGINAL-TEXT PRESERVATION
-        # ====================================================
-        #
-        # The original document must be recoverable by
-        # removing every inserted span and its separators.
-        #
-        # Reverse-order removal is necessary because deleting
-        # later insertions does not shift earlier offsets.
-        # ====================================================
+            original_count = len(
+                token_map(
+                    original,
+                    tokenizer
+                )[0]
+            )
 
-        reconstructed = modified_text
-
-        for record in reversed(own_records):
-
-            start = record["inserted_start_char"]
-            end = record["inserted_end_char"]
-
-            # Verify exact target text at its recorded offset.
-            if (
-                reconstructed[start:end]
-                != record["inserted_span"]
-            ):
-                raise RuntimeError(
-                    "Inserted span or offset mismatch"
+            for record in own_records:
+                record["original_token_count"] = (
+                    original_count
                 )
 
-            # Include the recorded separators in removal.
-            remove_start = (
-                start
-                - len(record["left_separator"])
+            final_token_observation(
+                modified,
+                own_records,
+                tokenizer
             )
 
-            remove_end = (
-                end
-                + len(record["right_separator"])
-            )
-
-            reconstructed = (
-                reconstructed[:remove_start]
-                + reconstructed[remove_end:]
-            )
-
-        # Exact character-for-character comparison.
-        if reconstructed != original_text:
-            raise RuntimeError(
-                "Original text was not preserved in "
-                f"Pile document {host['source_id']}"
-            )
-
-        # Store the complete document, even if unmodified.
         output_documents.append({
-
             "pile_source_id": host["source_id"],
+            "output_document_index": index,
 
-            "output_document_index": i,
+            "text": modified,
 
-            "text": modified_text,
-
-            "original_sha256": sha(original_text),
-
-            "modified_sha256": sha(modified_text),
+            "original_sha256": sha(original),
+            "modified_sha256": sha(modified),
 
             "insertion_count": len(own_records)
         })
 
-        insertion_records.extend(own_records)
-
-    # ========================================================
-    # PHASE D: VERIFY PER-TARGET FREQUENCY
-    # ========================================================
-    #
-    # Check that:
-    #   1. Recorded insertion count matches planned frequency.
-    #   2. Every insertion for a target uses a distinct host.
-    # ========================================================
-
-    for target in target_info:
-
-        actual = [
-            record
-            for record in insertion_records
-            if record["target_id"] == target["id"]
-        ]
-
-        unique_hosts = {
-            record["pile_source_id"]
-            for record in actual
-        }
-
-        if (
-            len(actual) != target["frequency"]
-            or len(unique_hosts) != len(actual)
-        ):
-            raise RuntimeError(
-                "Frequency or distinct-host "
-                "validation failed"
-            )
+        insertion_records.extend(
+            own_records
+        )
 
     return (
         output_documents,
-        target_info,
+        target_information,
         insertion_records
     )
 
 
 # ============================================================
-# 11. RUN EXPERIMENT AND SAVE OUTPUTS
+# 15. RUN EXPERIMENT AND SAVE JSONL
 # ============================================================
 
-def main():
+def run(
+    config,
+    tokenizer=None
+):
     """
-    Execute the controlled insertion experiment.
+    Run controlled insertion.
 
-    Outputs:
-        modified_dataset.json
+    Writes:
+        modified_dataset.jsonl
+        original_hosts.jsonl
         insertion_metadata.json
 
-    The script does not modify the original Hugging Face
-    dataset or perform any model training.
+    JSONL contains exactly one document per line.
     """
 
-    output_dir = Path(CONFIG["output_dir"])
+    folder = Path(
+        config["output_dir"]
+    )
 
-    # --------------------------------------------------------
-    # PREVENT ACCIDENTAL EXPERIMENT OVERWRITING
-    # --------------------------------------------------------
-
-    if output_dir.exists():
+    if folder.exists():
         raise FileExistsError(
-            "Choose a new output_dir. "
-            f"Already exists: {output_dir}"
+            f"Output directory already exists: {folder}"
         )
 
-    # --------------------------------------------------------
-    # LOAD ORIGINAL HOST DOCUMENTS
-    # --------------------------------------------------------
-
-    print("Loading selected Pile documents...")
-
-    hosts = load_hosts(CONFIG)
-
-    print(
-        f"Loaded {len(hosts)} existing Pile documents."
+    hosts = load_hosts(
+        config["pile"]
     )
 
-    # --------------------------------------------------------
-    # PERFORM CONTROLLED INSERTIONS AND VALIDATION
-    # --------------------------------------------------------
-
-    print("Applying controlled insertions...")
-
-    documents, targets, insertions = apply_insertions(
-        CONFIG,
-        hosts
+    documents, targets, records = insert_targets(
+        config,
+        hosts,
+        tokenizer=tokenizer
     )
 
-    # ========================================================
-    # OUTPUT 1: COMPLETE MODIFIED DATASET
-    # ========================================================
-    #
-    # The output contains every loaded host document,
-    # including documents that received no insertions.
-    #
-    # Documents remain in original source order.
-    #
-    # The dataset is saved as ONE JSON object.
-    # ========================================================
-
-    result = {
-
-        "dataset": CONFIG["dataset"],
-
-        "configuration": CONFIG,
-
-        "document_order":
-            "original_pile_stream_order_no_shuffle",
-
-        "training_time_exposure":
-            "not_controlled_by_dataset_editing",
-
-        "total_documents": len(documents),
-
-        "total_insertions": len(insertions),
-
-        "documents": documents
-    }
-
-    # ========================================================
-    # OUTPUT 2: INSERTION METADATA
-    # ========================================================
-    #
-    # Records experimental configuration, target frequencies,
-    # original host IDs, and exact insertion positions.
-    #
-    # The metadata is intended to support reproducibility
-    # and subsequent memorization analysis.
-    # ========================================================
-
-    metadata = {
-
-        "configuration": CONFIG,
-
-        "targets": targets,
-
-        "insertions": insertions,
-
-        "total_documents": len(documents),
-
-        "total_insertions": len(insertions),
-
-        "token_note": (
-            "Token positions use original tokenizer offsets. "
-            "Insertion may change tokenization at boundaries. "
-            "Exact post-insertion token identity is not guaranteed."
-        ),
-
-        "training_note": (
-            "The downstream trainer must preserve record order "
-            "to reproduce intended exposure order."
-        )
-    }
-
-    # --------------------------------------------------------
-    # CREATE EXPERIMENT OUTPUT DIRECTORY
-    # --------------------------------------------------------
-
-    output_dir.mkdir(
+    folder.mkdir(
         parents=True,
         exist_ok=False
     )
 
-    dataset_file = (
-        output_dir / "modified_dataset.json"
+    # --------------------------------------------------------
+    # A. MODIFIED DATASET — JSONL
+    # --------------------------------------------------------
+
+    dataset_path = (
+        folder / "modified_dataset.jsonl"
     )
 
-    metadata_file = (
-        output_dir / "insertion_metadata.json"
-    )
-
-    # --------------------------------------------------------
-    # SAVE COMPLETE MODIFIED DATASET
-    # --------------------------------------------------------
-    #
-    # ensure_ascii=False preserves Unicode characters.
-    # indent=2 creates human-readable JSON.
-    # "x" prevents accidental file overwriting.
-    with dataset_file.open(
+    with dataset_path.open(
         "x",
         encoding="utf-8"
     ) as file:
 
-        json.dump(
-            result,
-            file,
-            ensure_ascii=False,
-            indent=2
-        )
+        for document in documents:
+
+            file.write(
+                json.dumps(
+                    document,
+                    ensure_ascii=False
+                ) + "\n"
+            )
 
     # --------------------------------------------------------
-    # SAVE INSERTION METADATA
+    # B. ORIGINAL DOCUMENTS — JSONL
     # --------------------------------------------------------
 
-    with metadata_file.open(
+    originals_path = (
+        folder / "original_hosts.jsonl"
+    )
+
+    with originals_path.open(
+        "x",
+        encoding="utf-8"
+    ) as file:
+
+        for host in hosts:
+
+            file.write(
+                json.dumps(
+                    host,
+                    ensure_ascii=False
+                ) + "\n"
+            )
+
+    # --------------------------------------------------------
+    # C. INSERTION METADATA — JSON
+    # --------------------------------------------------------
+
+    metadata_path = (
+        folder / "insertion_metadata.json"
+    )
+
+    metadata = {
+        "configuration": config,
+
+        "dataset_format": "jsonl",
+
+        "dataset_file": dataset_path.name,
+        "original_hosts_file": originals_path.name,
+
+        "total_documents": len(documents),
+        "total_insertions": len(records),
+
+        "targets": targets,
+        "insertions": records
+    }
+
+    with metadata_path.open(
         "x",
         encoding="utf-8"
     ) as file:
@@ -1686,13 +1970,18 @@ def main():
         json.dump(
             metadata,
             file,
-            ensure_ascii=False,
-            indent=2
+            indent=2,
+            ensure_ascii=False
         )
 
-    # ========================================================
-    # PRINT FINAL EXPERIMENT SUMMARY
-    # ========================================================
+    # --------------------------------------------------------
+    # D. PRINT EXPERIMENT SUMMARY
+    # --------------------------------------------------------
+
+    modified_count = sum(
+        document["insertion_count"] > 0
+        for document in documents
+    )
 
     print("\nCONTROLLED INSERTION COMPLETE")
 
@@ -1702,41 +1991,55 @@ def main():
     )
 
     print(
+        "Modified documents:",
+        modified_count
+    )
+
+    print(
+        "Total targets:",
+        len(targets)
+    )
+
+    print(
         "Total insertions:",
-        len(insertions)
+        len(records)
     )
 
     print(
         "Modified dataset:",
-        dataset_file
+        dataset_path
+    )
+
+    print(
+        "Original documents:",
+        originals_path
     )
 
     print(
         "Insertion metadata:",
-        metadata_file
+        metadata_path
     )
 
-    print("\nINSERTION DETAILS")
-
-    for record in insertions:
-
-        print(
-            f"Target: {record['target_id']} | "
-            f"Pile document: {record['pile_source_id']} | "
-            f"Original character offset: "
-            f"{record['original_character_offset']}"
-        )
-
 
 # ============================================================
-# PROGRAM ENTRY POINT
-# ============================================================
-#
-# Execute main() only when running this script directly.
-#
-# Importing the module from another Python script will not
-# automatically download datasets or create output files.
+# 16. ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    from transformers import AutoTokenizer
+
+    # Load the tokenizer only once.
+    tokenizer = AutoTokenizer.from_pretrained(
+        CONFIG["tokenizer_name"],
+        revision=CONFIG.get(
+            "tokenizer_revision"
+        ),
+        use_fast=True
+    )
+
+    # The insertion engine receives the tokenizer object.
+    run(
+        CONFIG,
+        tokenizer=tokenizer
+    )
