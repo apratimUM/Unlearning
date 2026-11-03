@@ -1,10 +1,11 @@
 
-"""Train a randomly initialized GPT on immutable packed tokens.
+"""Train GPT-2 from scratch on a frozen Pile dataset.
 
-Depends on the existing model.py and runtime.py interfaces.
+Run:
+    python3 -u train.py
 
-No insertion is performed here: a future controlled-insertion scheduler
-must prepare the ordered document corpus upstream.
+Resume:
+    python3 -u train.py --resume
 """
 
 import argparse
@@ -30,34 +31,81 @@ from runtime import (
 )
 
 
-# ------------------------------------------------------------
-# Reproducibility
-# ------------------------------------------------------------
+# ============================================================
+# EXPERIMENT CONFIGURATION
+# ============================================================
+
+CONFIG = {
+    "data": "data/pile_large",
+    "run": "gpt2_small_pile_full",
+    "model": "small",
+    "block_size": 512,
+    "steps": 30000,
+    "batch": 4,
+    "accum": 8,
+    "seed": 42,
+    "gpu": 0,
+    "precision": "auto",
+    "lr": 0.0003,
+    "min_lr": 0.00003,
+    "warmup": 500,
+    "eval_every": 500,
+    "save_every": 1000,
+    "eval_batches": 50,
+
+    # Live terminal output frequency.
+    "log_every": 1,
+
+    # Periodic generation checks.
+    "check_begin": 1000,
+    "check_every": 500,
+
+    # One string or a list of strings.
+    "check_prompts": [
+        "Once upon a time",
+        "The capital of France is",
+        "Artificial intelligence is",
+    ],
+
+    # Generation settings.
+    "check_temperature": 0.8,
+    "check_max_new_tokens": 50,
+    "check_top_k": 50,
+    "check_do_sample": True,
+}
+
+WEIGHT_DECAY = 0.1
+ADAM_BETAS = (0.9, 0.95)
+MAX_GRAD_NORM = 1.0
+
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
 
 def seed_all(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
 def get_rng():
-    """Save random states for reproducible checkpoint resumption."""
-    return dict(
-        python=random.getstate(),
-        numpy=np.random.get_state(),
-        torch=torch.get_rng_state(),
-        cuda=(
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": (
             torch.cuda.get_rng_state_all()
             if torch.cuda.is_available()
             else None
         ),
-    )
+    }
 
 
 def set_rng(state):
-    """Restore RNG state after model and optimizer construction."""
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"])
@@ -66,9 +114,9 @@ def set_rng(state):
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-# ------------------------------------------------------------
-# Learning-rate schedule
-# ------------------------------------------------------------
+# ============================================================
+# LEARNING RATE
+# ============================================================
 
 def lr_schedule(step, args):
     """Linear warmup followed by cosine decay."""
@@ -90,12 +138,11 @@ def lr_schedule(step, args):
     ) * (1 + math.cos(math.pi * progress))
 
 
-# ------------------------------------------------------------
-# Padding-aware next-token loss
-# ------------------------------------------------------------
+# ============================================================
+# DATA MASKING AND LOSS
+# ============================================================
 
 def real_limit(manifest, split):
-    """Return the first artificial-padding token position."""
     return int(
         manifest.get("actual_tokens_before_padding", {}).get(
             split,
@@ -105,13 +152,7 @@ def real_limit(manifest, split):
 
 
 def valid_positions(block_ids, block_size, limit, device):
-    """Identify genuine next-token targets, excluding terminal padding.
-
-    Packed block k predicts original corpus positions:
-        k*T + 1 through (k+1)*T.
-
-    Actual EOS document separators are NOT padding and remain valid.
-    """
+    """Exclude artificial terminal padding from targets."""
 
     ids = torch.as_tensor(
         block_ids,
@@ -132,11 +173,7 @@ def valid_positions(block_ids, block_size, limit, device):
 
 
 def target_loss(logits, targets, valid):
-    """Return summed cross-entropy over genuine prediction targets.
-
-    Using reduction='sum' allows exact token-weighted accumulation
-    across microbatches containing different amounts of padding.
-    """
+    """Token-weighted cross-entropy, excluding padding."""
 
     labels = targets.masked_fill(~valid, -100)
 
@@ -148,19 +185,288 @@ def target_loss(logits, targets, valid):
     )
 
 
-# ------------------------------------------------------------
-# Validation
-# ------------------------------------------------------------
+# ============================================================
+# GENERATION FUNCTION
+# ============================================================
+
+def check_generation(
+    model,
+    tokenizer,
+    inputs,
+    device,
+    cast,
+    **kwargs,
+):
+    """Generate text for one or multiple prompts.
+
+    Supports kwargs:
+        temperature
+        max_new_tokens
+        top_k
+        do_sample
+        seed
+
+    Single input -> string
+    List of inputs -> list of strings
+
+    Prompts with identical token lengths are batched.
+    Different-length prompts run in separate length groups.
+    """
+
+    temperature = kwargs.pop("temperature", 1.0)
+    max_new_tokens = kwargs.pop("max_new_tokens", 50)
+    top_k = kwargs.pop("top_k", None)
+    do_sample = kwargs.pop("do_sample", True)
+    seed = kwargs.pop("seed", 42)
+
+    if kwargs:
+        raise TypeError(
+            f"Unsupported generation kwargs: {sorted(kwargs)}"
+        )
+
+    if not isinstance(max_new_tokens, int) or max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be nonnegative")
+
+    if (
+        not isinstance(temperature, (int, float))
+        or not math.isfinite(temperature)
+        or temperature <= 0
+    ):
+        raise ValueError("Temperature must be finite and positive")
+
+    if top_k is not None:
+        if not isinstance(top_k, int) or not (
+            1 <= top_k <= model.config.vocab_size
+        ):
+            raise ValueError("Invalid top_k")
+
+    if not isinstance(do_sample, bool):
+        raise ValueError("do_sample must be boolean")
+
+    if not isinstance(seed, int) or seed < 0:
+        raise ValueError("Invalid seed")
+
+    # Accept a single prompt or multiple prompts.
+    single_input = isinstance(inputs, str)
+
+    if single_input:
+        prompts = [inputs]
+    elif isinstance(inputs, (list, tuple)):
+        prompts = list(inputs)
+    else:
+        raise TypeError(
+            "inputs must be a string or list of strings"
+        )
+
+    if not prompts or any(
+        not isinstance(prompt, str) for prompt in prompts
+    ):
+        raise ValueError("Provide one or more text prompts")
+
+    # Tokenize each prompt.
+    encoded = [
+        tokenizer.encode(
+            prompt,
+            add_special_tokens=False,
+        )
+        for prompt in prompts
+    ]
+
+    if any(len(ids) == 0 for ids in encoded):
+        raise ValueError("A prompt produced no tokens")
+
+    # Prevent positional embedding overflow.
+    if any(
+        len(ids) + max_new_tokens > model.config.block_size
+        for ids in encoded
+    ):
+        raise ValueError(
+            "Prompt + generated tokens exceeds block_size"
+        )
+
+    # Group prompts for genuine batched inference.
+    # No padding masks are required for equal-length groups.
+    groups = {}
+
+    for i, ids in enumerate(encoded):
+        groups.setdefault(len(ids), []).append(i)
+
+    outputs = [None] * len(prompts)
+
+    was_training = model.training
+
+    # Local RNG avoids modifying global training RNG state.
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+
+    try:
+        # Switch model to evaluation mode.
+        model.eval()
+
+        # Disable gradient computation.
+        with torch.inference_mode():
+
+            for prompt_length, indices in groups.items():
+
+                tokens = torch.tensor(
+                    [encoded[i] for i in indices],
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                for _ in range(max_new_tokens):
+
+                    with cast():
+                        logits, _ = model(tokens)
+
+                    next_logits = logits[:, -1, :].float()
+
+                    if do_sample:
+
+                        # Apply temperature.
+                        next_logits = next_logits / temperature
+
+                        # Optional top-k filtering.
+                        if top_k is not None:
+
+                            values, _ = torch.topk(
+                                next_logits,
+                                top_k,
+                                dim=-1,
+                            )
+
+                            threshold = values[:, [-1]]
+
+                            next_logits = next_logits.masked_fill(
+                                next_logits < threshold,
+                                float("-inf"),
+                            )
+
+                        probabilities = torch.softmax(
+                            next_logits,
+                            dim=-1,
+                        )
+
+                        next_token = torch.multinomial(
+                            probabilities,
+                            num_samples=1,
+                            generator=generator,
+                        )
+
+                    else:
+
+                        # Greedy decoding.
+                        next_token = torch.argmax(
+                            next_logits,
+                            dim=-1,
+                            keepdim=True,
+                        )
+
+                    tokens = torch.cat(
+                        (tokens, next_token),
+                        dim=1,
+                    )
+
+                # Return only the generated continuation.
+                generated_ids = tokens[:, prompt_length:].tolist()
+
+                for index, ids in zip(indices, generated_ids):
+                    outputs[index] = tokenizer.decode(
+                        ids,
+                        skip_special_tokens=False,
+                    )
+
+    finally:
+        # Always restore the model's previous mode.
+        model.train(was_training)
+
+    return outputs[0] if single_input else outputs
+
+
+# ============================================================
+# GENERATION LOGGING
+# ============================================================
+
+def log_generation(run, step, prompts, outputs, args):
+    """Print and save generated text."""
+
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
+    if isinstance(outputs, str):
+        outputs = [outputs]
+
+    if len(prompts) != len(outputs):
+        raise ValueError("Prompt/output count mismatch")
+
+    print(
+        f"\n{'=' * 60}\n"
+        f"GENERATION CHECK AT STEP {step}\n"
+        f"{'=' * 60}",
+        flush=True,
+    )
+
+    output_file = run / "generation_checks.jsonl"
+
+    with output_file.open("a", encoding="utf-8") as f:
+
+        for i, (prompt, output) in enumerate(
+            zip(prompts, outputs)
+        ):
+            print(
+                f"\nPrompt {i + 1}: {prompt}\n"
+                f"Output {i + 1}: {output}",
+                flush=True,
+            )
+
+            record = {
+                "step": step,
+                "prompt_index": i,
+                "prompt": prompt,
+                "generated": output,
+                "temperature": args.check_temperature,
+                "max_new_tokens": args.check_max_new_tokens,
+                "top_k": args.check_top_k,
+                "do_sample": args.check_do_sample,
+                "seed": args.seed + step,
+            }
+
+            f.write(
+                json.dumps(record, ensure_ascii=False) + "\n"
+            )
+
+
+def trim_step_log(path, checkpoint_step):
+    """Discard logs beyond the last committed checkpoint."""
+
+    if not path.exists():
+        return
+
+    retained = []
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+            if record["step"] <= checkpoint_step:
+                retained.append(line)
+        except (ValueError, KeyError):
+            pass
+
+    path.write_text(
+        "".join(line + "\n" for line in retained),
+        encoding="utf-8",
+    )
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
 
 @torch.no_grad()
 def validation(model, sampler, args, device, cast, manifest):
-    """Evaluate fixed deterministic validation blocks.
+    """Evaluate deterministic held-out validation blocks."""
 
-    Validation never updates model weights.
-
-    The same packed blocks are evaluated at each checkpoint.
-    """
-
+    was_training = model.training
     model.eval()
 
     total_loss = 0.0
@@ -168,55 +474,47 @@ def validation(model, sampler, args, device, cast, manifest):
 
     limit = real_limit(manifest, "val")
 
-    for micro in range(args.eval_batches):
+    try:
+        for micro in range(args.eval_batches):
 
-        first = micro * args.batch
-
-        ids = sampler.block_ids(
-            first,
-            args.batch,
-        )
-
-        # Pass eval_batches as accumulation so micro indices are valid.
-        x, y = sampler.batch(
-            0,
-            micro,
-            args.batch,
-            args.eval_batches,
-        )
-
-        x = x.to(device)
-        y = y.to(device)
-
-        valid = valid_positions(
-            ids,
-            args.block_size,
-            limit,
-            device,
-        )
-
-        valid_count = int(valid.sum().item())
-
-        if valid_count == 0:
-            continue
-
-        with cast():
-            # No targets are passed to model.forward().
-            # Cross-entropy is computed once by target_loss().
-            logits, _ = model(x)
-
-            loss_sum = target_loss(
-                logits,
-                y,
-                valid,
+            ids = sampler.block_ids(
+                micro * args.batch,
+                args.batch,
             )
 
-        total_loss += loss_sum.item()
-        total_valid += valid_count
+            x, y = sampler.batch(
+                0,
+                micro,
+                args.batch,
+                args.eval_batches,
+            )
 
-        del logits, loss_sum
+            x = x.to(device)
+            y = y.to(device)
 
-    model.train()
+            valid = valid_positions(
+                ids,
+                args.block_size,
+                limit,
+                device,
+            )
+
+            count = int(valid.sum().item())
+
+            if count == 0:
+                continue
+
+            with cast():
+                logits, _ = model(x)
+                loss_sum = target_loss(logits, y, valid)
+
+            total_loss += loss_sum.item()
+            total_valid += count
+
+            del logits, loss_sum
+
+    finally:
+        model.train(was_training)
 
     if total_valid == 0:
         raise ValueError("No valid validation targets")
@@ -224,88 +522,144 @@ def validation(model, sampler, args, device, cast, manifest):
     return total_loss / total_valid
 
 
-# ------------------------------------------------------------
-# Document exposure accounting
-# ------------------------------------------------------------
+# ============================================================
+# DOCUMENT EXPOSURE ACCOUNTING
+# ============================================================
 
 def save_exposures(sampler, run, step, consumed):
-    """Record approximate input-token exposure for each document.
+    """Save approximate input-token exposure per document."""
 
-    These counts are not complete-document presentations.
-    """
-
-    output = (
-        run
-        / f"document_exposures_step_{step:07d}.jsonl"
-    )
+    output = run / f"document_exposures_step_{step:07d}.jsonl"
 
     with output.open("w", encoding="utf-8") as f:
-
         for row in sampler.document_exposures(consumed):
-
             record = {
                 **row,
                 "checkpoint_step": step,
             }
 
-            f.write(
-                json.dumps(record) + "\n"
-            )
+            f.write(json.dumps(record) + "\n")
 
 
-# ------------------------------------------------------------
-# Main training program
-# ------------------------------------------------------------
+# ============================================================
+# CONFIGURATION PARSER
+# ============================================================
 
-def main():
+def parse_args():
+    """Use CONFIG defaults with optional CLI overrides."""
 
     p = argparse.ArgumentParser(description=__doc__)
 
-    # Dataset and run identity
-    p.add_argument("--data", default="data/pile")
-    p.add_argument("--run", required=True)
-
-    # Model
+    p.add_argument("--data", default=CONFIG["data"])
+    p.add_argument("--run", default=CONFIG["run"])
     p.add_argument(
         "--model",
         choices=["micro", "tiny", "small"],
-        default="small",
+        default=CONFIG["model"],
     )
 
-    p.add_argument("--block-size", type=int, default=512)
-
-    # Training
-    p.add_argument("--steps", type=int, default=20000)
-    p.add_argument("--batch", type=int, default=8)
-    p.add_argument("--accum", type=int, default=4)
-    p.add_argument("--seed", type=int, default=42)
-
-    # Device
-    p.add_argument("--gpu", type=int, default=0)
+    p.add_argument(
+        "--block-size",
+        type=int,
+        default=CONFIG["block_size"],
+    )
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=CONFIG["steps"],
+    )
+    p.add_argument(
+        "--batch",
+        type=int,
+        default=CONFIG["batch"],
+    )
+    p.add_argument(
+        "--accum",
+        type=int,
+        default=CONFIG["accum"],
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=CONFIG["seed"],
+    )
+    p.add_argument(
+        "--gpu",
+        type=int,
+        default=CONFIG["gpu"],
+    )
     p.add_argument(
         "--precision",
         choices=["auto", "bfloat16", "float16", "float32"],
-        default="auto",
+        default=CONFIG["precision"],
     )
 
-    # Optimization
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--min-lr", type=float, default=3e-5)
-    p.add_argument("--warmup", type=int, default=200)
+    p.add_argument(
+        "--lr",
+        type=float,
+        default=CONFIG["lr"],
+    )
+    p.add_argument(
+        "--min-lr",
+        type=float,
+        default=CONFIG["min_lr"],
+    )
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=CONFIG["warmup"],
+    )
 
-    # Evaluation and checkpointing
-    p.add_argument("--eval-every", type=int, default=500)
-    p.add_argument("--save-every", type=int, default=500)
-    p.add_argument("--eval-batches", type=int, default=20)
+    p.add_argument(
+        "--eval-every",
+        type=int,
+        default=CONFIG["eval_every"],
+    )
+    p.add_argument(
+        "--save-every",
+        type=int,
+        default=CONFIG["save_every"],
+    )
+    p.add_argument(
+        "--eval-batches",
+        type=int,
+        default=CONFIG["eval_batches"],
+    )
 
-    # Resumption
+    # Live terminal output.
+    p.add_argument(
+        "--log-every",
+        type=int,
+        default=CONFIG["log_every"],
+    )
+
+    # Supervisor-requested generation schedule.
+    p.add_argument(
+        "--check_begin",
+        "--check-begin",
+        type=int,
+        default=CONFIG["check_begin"],
+    )
+    p.add_argument(
+        "--check_every",
+        "--check-every",
+        type=int,
+        default=CONFIG["check_every"],
+    )
+
     p.add_argument("--resume", action="store_true")
 
     args = p.parse_args()
 
-    # --------------------------------------------------------
-    # Validate arguments
-    # --------------------------------------------------------
+    # Generation settings stay in CONFIG.
+    for key in (
+        "check_prompts",
+        "check_temperature",
+        "check_max_new_tokens",
+        "check_top_k",
+        "check_do_sample",
+    ):
+        setattr(args, key, CONFIG[key])
 
     if min(
         args.steps,
@@ -315,6 +669,7 @@ def main():
         args.eval_every,
         args.save_every,
         args.eval_batches,
+        args.log_every,
     ) < 1:
         p.error("Training counts must be positive")
 
@@ -327,40 +682,226 @@ def main():
     if not 0 <= args.min_lr <= args.lr or args.lr <= 0:
         p.error("Invalid learning rates")
 
+    if args.check_begin < 1 or args.check_every < 0:
+        p.error("Invalid generation check schedule")
+
+    if args.check_every > 0:
+        if not args.check_prompts:
+            p.error("Configure check_prompts in CONFIG")
+
+        if (
+            not isinstance(args.check_max_new_tokens, int)
+            or args.check_max_new_tokens < 0
+        ):
+            p.error("Invalid max_new_tokens")
+
+        if (
+            not isinstance(args.check_temperature, (int, float))
+            or not math.isfinite(args.check_temperature)
+            or args.check_temperature <= 0
+        ):
+            p.error("Invalid generation temperature")
+
+        if args.check_top_k is not None:
+            if not isinstance(args.check_top_k, int) or not (
+                1 <= args.check_top_k <= 50257
+            ):
+                p.error("Invalid top_k")
+
+        if not isinstance(args.check_do_sample, bool):
+            p.error("check_do_sample must be boolean")
+
+    return args
+
+
+# ============================================================
+# CHECKPOINT HELPERS
+# ============================================================
+
+def save_checkpoint(
+    model,
+    optimizer,
+    scaler,
+    run,
+    step,
+    signature,
+    sampler,
+    args,
+):
+    """Save resumable checkpoint and extraction snapshot."""
+
+    state = {
+        "model": model.state_dict(),
+        "config": vars(model.config),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict(),
+        "rng": get_rng(),
+        "step": step,
+        "signature": signature,
+        "manifest_sha256": signature["manifest_sha256"],
+    }
+
+    checkpoint_file = run / "latest.pt"
+    temporary = run / "latest.tmp"
+
+    torch.save(state, temporary)
+    os.replace(temporary, checkpoint_file)
+
+    snapshot = {
+        k: state[k]
+        for k in (
+            "model",
+            "config",
+            "step",
+            "signature",
+            "manifest_sha256",
+        )
+    }
+
+    torch.save(
+        snapshot,
+        run / f"step_{step:07d}.pt",
+    )
+
+    save_exposures(
+        sampler,
+        run,
+        step,
+        step * args.batch * args.accum,
+    )
+
+    print(f"[SAVE] Checkpoint saved: step {step}", flush=True)
+
+
+# ============================================================
+# MAIN TRAINING PROGRAM
+# ============================================================
+
+def main():
+
+    args = parse_args()
+
+    print("=" * 60, flush=True)
+    print("GPT-2 PRETRAINING", flush=True)
+    print("=" * 60, flush=True)
+
+    print(f"Dataset:             {args.data}", flush=True)
+    print(f"Run name:            {args.run}", flush=True)
+    print(f"Model:               {args.model}", flush=True)
+    print(f"Context length:      {args.block_size}", flush=True)
+    print(f"Optimizer steps:     {args.steps}", flush=True)
+    print(f"Microbatch size:     {args.batch}", flush=True)
+    print(f"Gradient accum:      {args.accum}", flush=True)
+    print(f"Precision:           {args.precision}", flush=True)
+    print(f"Progress interval:   {args.log_every}", flush=True)
+    print(
+        f"Generation enabled:  {args.check_every > 0}",
+        flush=True,
+    )
+
+    if args.check_every > 0:
+        print(
+            f"Generation begins:   {args.check_begin}",
+            flush=True,
+        )
+        print(
+            f"Generation interval: {args.check_every}",
+            flush=True,
+        )
+
+    print("=" * 60, flush=True)
+
     # --------------------------------------------------------
-    # Device, precision and random initialization
+    # Device and reproducibility
     # --------------------------------------------------------
+
+    print("[SETUP] Checking CUDA GPU...", flush=True)
 
     device = require_cuda(args.gpu)
-
-    amp_dtype = choose_precision(
-        args.precision,
-        device,
-    )
-
+    amp_dtype = choose_precision(args.precision, device)
     cast = lambda: autocast_context(amp_dtype)
 
-    runtime_info = provenance(
-        device,
-        amp_dtype,
-    )
+    runtime_info = provenance(device, amp_dtype)
 
     seed_all(args.seed)
 
     # --------------------------------------------------------
-    # Verify frozen dataset
+    # Verify dataset
     # --------------------------------------------------------
 
     folder = Path(args.data)
+
+    print(
+        f"[SETUP] Verifying dataset: {folder}",
+        flush=True,
+    )
 
     manifest = verify_data(folder)
 
     if args.block_size != int(manifest["block_size"]):
         raise ValueError(
-            "Training block size differs from preparation"
+            "Training block size differs from prepare.py"
         )
 
-    # Training and validation have separate deterministic streams.
+    print("[SETUP] Dataset verified", flush=True)
+
+    # --------------------------------------------------------
+    # Load tokenizer for generation
+    # --------------------------------------------------------
+
+    tokenizer = None
+
+    if args.check_every > 0:
+
+        print(
+            "[SETUP] Loading generation tokenizer...",
+            flush=True,
+        )
+
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            folder / "tokenizer",
+            local_files_only=True,
+        )
+
+        prompts = (
+            [args.check_prompts]
+            if isinstance(args.check_prompts, str)
+            else list(args.check_prompts)
+        )
+
+        if not prompts or any(
+            not isinstance(prompt, str) for prompt in prompts
+        ):
+            raise ValueError(
+                "check_prompts must be a string or list of strings"
+            )
+
+        for prompt in prompts:
+            ids = tokenizer.encode(
+                prompt,
+                add_special_tokens=False,
+            )
+
+            if (
+                not ids
+                or len(ids) + args.check_max_new_tokens
+                > args.block_size
+            ):
+                raise ValueError(
+                    f"Invalid or overlong prompt: {prompt!r}"
+                )
+
+    # --------------------------------------------------------
+    # Samplers
+    # --------------------------------------------------------
+
+    print(
+        "[SETUP] Creating training and validation samplers...",
+        flush=True,
+    )
+
     train = PackedSampler(
         folder,
         "train",
@@ -376,7 +917,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Checkpoint identity
+    # Run identity
     # --------------------------------------------------------
 
     run = Path("runs") / args.run
@@ -399,7 +940,7 @@ def main():
         for name in (
             "model.py",
             "data.py",
-            "train.py",
+            Path(__file__).name,
             "runtime.py",
         )
     }
@@ -408,13 +949,21 @@ def main():
 
     try:
 
-        # ----------------------------------------------------
-        # Load model or resume existing run
-        # ----------------------------------------------------
+        # ====================================================
+        # MODEL INITIALIZATION / RESUMPTION
+        # ====================================================
 
         if args.resume:
 
-            # Only load trusted checkpoints created by this project.
+            print(
+                "[SETUP] Resuming from checkpoint...",
+                flush=True,
+            )
+
+            if not checkpoint_file.exists():
+                raise FileNotFoundError(checkpoint_file)
+
+            # Load trusted checkpoints only.
             ckpt = torch.load(
                 checkpoint_file,
                 map_location="cpu",
@@ -433,7 +982,6 @@ def main():
                 )
 
             model.load_state_dict(ckpt["model"])
-
             start = int(ckpt["step"])
 
             if not 0 <= start <= args.steps:
@@ -443,12 +991,17 @@ def main():
 
             if run.exists():
                 raise FileExistsError(
-                    f"Run already exists: {run}"
+                    f"Run already exists: {run}. "
+                    "Use --resume or choose a new run name."
                 )
 
             run.mkdir(parents=True)
 
-            # Random initialization: no pretrained weights loaded.
+            print(
+                "[SETUP] Initializing model from scratch...",
+                flush=True,
+            )
+
             with torch.device(device):
                 model = make_model(
                     args.model,
@@ -471,13 +1024,17 @@ def main():
 
         if model.config.vocab_size < int(manifest["vocab_size"]):
             raise ValueError(
-                "Model vocabulary is smaller than "
-                "the saved tokenizer vocabulary"
+                "Model vocabulary is smaller than tokenizer vocabulary"
             )
 
-        # ----------------------------------------------------
-        # AdamW optimizer
-        # ----------------------------------------------------
+        # ====================================================
+        # OPTIMIZER
+        # ====================================================
+
+        print(
+            "[SETUP] Creating AdamW optimizer...",
+            flush=True,
+        )
 
         optimizer = torch.optim.AdamW(
             [
@@ -486,7 +1043,7 @@ def main():
                         p for p in model.parameters()
                         if p.dim() >= 2
                     ],
-                    "weight_decay": 0.1,
+                    "weight_decay": WEIGHT_DECAY,
                 },
                 {
                     "params": [
@@ -497,62 +1054,40 @@ def main():
                 },
             ],
             lr=args.lr,
-            betas=(0.9, 0.95),
+            betas=ADAM_BETAS,
         )
 
         scaler = make_scaler(amp_dtype)
 
-        # ----------------------------------------------------
-        # Restore complete training state
-        # ----------------------------------------------------
+        # ====================================================
+        # RESTORE STATE
+        # ====================================================
 
         if args.resume:
 
-            optimizer.load_state_dict(
-                ckpt["optimizer"]
-            )
+            optimizer.load_state_dict(ckpt["optimizer"])
 
             for state in optimizer.state.values():
-
                 for key, value in state.items():
-
                     if torch.is_tensor(value):
                         state[key] = value.to(device)
 
-            scaler.load_state_dict(
-                ckpt["scaler"]
-            )
+            scaler.load_state_dict(ckpt["scaler"])
 
             set_rng(ckpt["rng"])
 
-            # Discard metrics written after the last committed checkpoint.
-            metrics_file = run / "metrics.jsonl"
+            trim_step_log(
+                run / "metrics.jsonl",
+                start,
+            )
 
-            if metrics_file.exists():
-
-                retained = []
-
-                for line in metrics_file.read_text(
-                    encoding="utf-8"
-                ).splitlines():
-
-                    try:
-                        record = json.loads(line)
-
-                        if record["step"] <= start:
-                            retained.append(line)
-
-                    except (ValueError, KeyError):
-                        pass
-
-                metrics_file.write_text(
-                    "".join(line + "\n" for line in retained),
-                    encoding="utf-8",
-                )
+            trim_step_log(
+                run / "generation_checks.jsonl",
+                start,
+            )
 
         else:
 
-            # Step-zero model, before any optimizer updates.
             torch.save(
                 {
                     "model": model.state_dict(),
@@ -565,21 +1100,25 @@ def main():
             )
 
         parameters = sum(
-            p.numel()
-            for p in model.parameters()
+            p.numel() for p in model.parameters()
         )
 
         print(
-            "Model parameters:", parameters,
-            "| Training blocks:", train.n_blocks,
-            "| Starting step:", start,
+            f"Model parameters: {parameters:,}",
+            f"| Training blocks: {train.n_blocks:,}",
+            f"| Starting step: {start}",
             flush=True,
         )
 
         limit = real_limit(manifest, "train")
 
+        print(
+            "[TRAIN] Starting optimizer updates...",
+            flush=True,
+        )
+
         # ====================================================
-        # Main pretraining loop
+        # MAIN PRETRAINING LOOP
         # ====================================================
 
         for step in range(start, args.steps):
@@ -594,7 +1133,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             # ------------------------------------------------
-            # Determine which blocks appear in this update
+            # Select deterministic training blocks
             # ------------------------------------------------
 
             micro_ids = [
@@ -605,10 +1144,7 @@ def main():
                 for micro in range(args.accum)
             ]
 
-            # Count genuine targets efficiently.
-            # Each block's target positions are k*T+1 ... (k+1)*T.
-            # Artificial padding targets are excluded.
-
+            # Count valid next-token targets.
             counts = [
                 sum(
                     max(
@@ -632,9 +1168,9 @@ def main():
 
             total_loss = 0.0
 
-            # ------------------------------------------------
-            # Gradient accumulation
-            # ------------------------------------------------
+            # =================================================
+            # GRADIENT ACCUMULATION
+            # =================================================
 
             for micro, ids in enumerate(micro_ids):
 
@@ -659,11 +1195,7 @@ def main():
                 )
 
                 with cast():
-
-                    # Compute model logits only.
-                    # Our own target_loss handles the labels and padding.
                     logits, _ = model(x)
-
                     loss_sum = target_loss(
                         logits,
                         y,
@@ -675,8 +1207,6 @@ def main():
                         f"Nonfinite loss at optimizer step {step}"
                     )
 
-                # Normalize by ALL valid prediction tokens in this update.
-                # This gives consistent per-token weighting.
                 scaled_loss = loss_sum / total_valid
 
                 scaler.scale(scaled_loss).backward()
@@ -685,15 +1215,15 @@ def main():
 
                 del logits, loss_sum, scaled_loss
 
-            # ------------------------------------------------
-            # Gradient clipping
-            # ------------------------------------------------
+            # =================================================
+            # GRADIENT CLIPPING
+            # =================================================
 
             scaler.unscale_(optimizer)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
-                max_norm=1.0,
+                max_norm=MAX_GRAD_NORM,
             )
 
             if not torch.isfinite(grad_norm):
@@ -701,24 +1231,82 @@ def main():
                     f"Nonfinite gradient norm at step {step}"
                 )
 
-            # ------------------------------------------------
-            # Optimizer update
-            # ------------------------------------------------
+            # =================================================
+            # OPTIMIZER UPDATE
+            # =================================================
 
-            # Runtime helper must verify that the optimizer step
-            # actually occurred, including with mixed precision.
-            checked_optimizer_step(scaler, optimizer)
+            checked_optimizer_step(
+                scaler,
+                optimizer,
+            )
 
             done = step + 1
 
-            # ------------------------------------------------
-            # Validation
-            # ------------------------------------------------
+            # =================================================
+            # LIVE TRAINING OUTPUT
+            # =================================================
+
+            if (
+                done % args.log_every == 0
+                or done == args.steps
+            ):
+                print(
+                    f"[TRAIN] step {done}/{args.steps} "
+                    f"| loss={total_loss / total_valid:.5f} "
+                    f"| lr={lr:.3e} "
+                    f"| grad_norm={grad_norm.item():.4f}",
+                    flush=True,
+                )
+
+            # =================================================
+            # PERIODIC GENERATION CHECK
+            # =================================================
+
+            if (
+                args.check_every > 0
+                and done >= args.check_begin
+                and (done - args.check_begin) % args.check_every == 0
+            ):
+
+                print(
+                    f"[GENERATE] Step {done}: generating text...",
+                    flush=True,
+                )
+
+                outputs = check_generation(
+                    model=model,
+                    tokenizer=tokenizer,
+                    inputs=args.check_prompts,
+                    device=device,
+                    cast=cast,
+                    temperature=args.check_temperature,
+                    max_new_tokens=args.check_max_new_tokens,
+                    top_k=args.check_top_k,
+                    do_sample=args.check_do_sample,
+                    seed=args.seed + done,
+                )
+
+                log_generation(
+                    run=run,
+                    step=done,
+                    prompts=args.check_prompts,
+                    outputs=outputs,
+                    args=args,
+                )
+
+            # =================================================
+            # VALIDATION
+            # =================================================
 
             if (
                 done % args.eval_every == 0
                 or done == args.steps
             ):
+
+                print(
+                    f"[VALIDATE] Step {done}: evaluating...",
+                    flush=True,
+                )
 
                 val_loss = validation(
                     model,
@@ -753,78 +1341,52 @@ def main():
                 with (
                     run / "metrics.jsonl"
                 ).open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(metrics) + "\n")
 
-                    f.write(
-                        json.dumps(metrics) + "\n"
-                    )
+                print(
+                    f"[VALIDATE] step={done} "
+                    f"| train_loss={metrics['train_loss']:.5f} "
+                    f"| val_loss={val_loss:.5f} "
+                    f"| val_ppl={metrics['val_perplexity']:.3f}",
+                    flush=True,
+                )
 
-                print(metrics, flush=True)
-
-            # ------------------------------------------------
-            # Save checkpoints
-            # ------------------------------------------------
+            # =================================================
+            # CHECKPOINT SAVING
+            # =================================================
 
             if (
                 done % args.save_every == 0
                 or done == args.steps
             ):
 
-                state = {
-                    "model": model.state_dict(),
-                    "config": vars(model.config),
-                    "optimizer": optimizer.state_dict(),
-                    "scaler": scaler.state_dict(),
-                    "rng": get_rng(),
-                    "step": done,
-                    "signature": signature,
-                    "manifest_sha256": signature["manifest_sha256"],
-                }
-
-                # Atomically save resumable checkpoint.
-                temporary = run / "latest.tmp"
-
-                torch.save(
-                    state,
-                    temporary,
-                )
-
-                os.replace(
-                    temporary,
-                    checkpoint_file,
-                )
-
-                # Save model-only numbered checkpoint for extraction.
-                snapshot = {
-                    k: state[k]
-                    for k in (
-                        "model",
-                        "config",
-                        "step",
-                        "signature",
-                        "manifest_sha256",
-                    )
-                }
-
-                torch.save(
-                    snapshot,
-                    run / f"step_{done:07d}.pt",
-                )
-
-                # Document exposure reports for memorization analysis.
-                save_exposures(
-                    train,
-                    run,
-                    done,
-                    done * args.batch * args.accum,
-                )
-
                 print(
-                    "Saved checkpoint:", done,
+                    f"[SAVE] Step {done}: writing checkpoint...",
                     flush=True,
                 )
 
-    finally:
+                save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    run=run,
+                    step=done,
+                    signature=signature,
+                    sampler=train,
+                    args=args,
+                )
 
+        print(
+            "\nTRAINING COMPLETE",
+            flush=True,
+        )
+
+        print(
+            f"Final checkpoint: {checkpoint_file}",
+            flush=True,
+        )
+
+    finally:
         train.close()
         val.close()
 
