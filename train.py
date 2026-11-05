@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +41,7 @@ CONFIG = {
     "run": "gpt2_small_pile_full",
     "model": "small",
     "block_size": 512,
-    "steps": 30000,
+    "steps": 3000,
     "batch": 4,
     "accum": 8,
     "seed": 42,
@@ -92,10 +93,25 @@ def seed_all(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def _numpy_rng_to_safe(state):
+    name, keys, pos, has_gauss, cached_gauss = state
+    return (name, torch.tensor(keys.astype(np.int64)), pos,
+            has_gauss, cached_gauss)
+
+
+def _numpy_rng_from_safe(state):
+    name, keys, pos, has_gauss, cached_gauss = state
+    if torch.is_tensor(keys):
+        keys = keys.cpu().numpy().astype(np.uint32)
+    return (name, keys, pos, has_gauss, cached_gauss)
+
+
 def get_rng():
     return {
         "python": random.getstate(),
-        "numpy": np.random.get_state(),
+        # Encode numpy MT19937 state as safe primitives/tensor so PyTorch
+        # weights_only=True can load the complete checkpoint for evaluation.
+        "numpy": _numpy_rng_to_safe(np.random.get_state()),
         "torch": torch.get_rng_state(),
         "cuda": (
             torch.cuda.get_rng_state_all()
@@ -107,7 +123,7 @@ def get_rng():
 
 def set_rng(state):
     random.setstate(state["python"])
-    np.random.set_state(state["numpy"])
+    np.random.set_state(_numpy_rng_from_safe(state["numpy"]))
     torch.set_rng_state(state["torch"])
 
     if state["cuda"] is not None and torch.cuda.is_available():
@@ -648,6 +664,12 @@ def parse_args():
     )
 
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--resume-from", type=Path, default=None,
+                   help="Resume from a full-state step_*.pt/latest.pt; use a new --run to fork historical checkpoints")
+    p.add_argument("--migrate-legacy-resume", action="store_true",
+                   help="Explicitly allow old latest.pt with optimizer state to resume after this checkpoint-only code migration")
+    p.add_argument("--insertion-metadata", type=Path, default=None,
+                   help="Controlled insertion JSON metadata used to prepare this dataset; optional for baseline")
 
     args = p.parse_args()
 
@@ -661,6 +683,10 @@ def parse_args():
     ):
         setattr(args, key, CONFIG[key])
 
+    if args.resume_from is not None and not args.resume:
+        p.error("--resume-from requires --resume")
+    if args.insertion_metadata is not None and not args.insertion_metadata.is_file():
+        p.error("--insertion-metadata must point to a JSON file")
     if min(
         args.steps,
         args.batch,
@@ -718,59 +744,104 @@ def parse_args():
 # CHECKPOINT HELPERS
 # ============================================================
 
-def save_checkpoint(
-    model,
-    optimizer,
-    scaler,
-    run,
-    step,
-    signature,
-    sampler,
-    args,
-):
-    """Save resumable checkpoint and extraction snapshot."""
+def _write_json_atomic(path, record):
+    """Write complete metadata without leaving a partially written file."""
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False)
+                    + "\n", encoding="utf-8")
+    os.replace(temp, path)
 
+
+def save_checkpoint(model, optimizer, scaler, run, step, signature, sampler,
+                    args, last_loss=None):
+    """Save a full resumable historical checkpoint AND a matching JSON record.
+
+    `latest.pt` points to a complete checkpoint (hard link where supported).
+    Historical step_*.pt are never overwritten; every one is resumable.
+    """
+    if step < 0:
+        raise ValueError("Negative checkpoint step")
+    epoch_fraction = (step * args.batch * args.accum) / sampler.n_blocks
+    lr = optimizer.param_groups[0]["lr"]
+    schedule_state = {
+        "type": "manual_linear_warmup_cosine_decay",
+        "completed_optimizer_steps": step,
+        "next_step_index": step,
+        "warmup": args.warmup,
+        "total_steps": args.steps,
+        "base_lr": args.lr,
+        "min_lr": args.min_lr,
+        "last_applied_lr": lr,
+        "scheduler_state_dict": None,
+        "note": "No torch scheduler object exists; lr_schedule(step,args) is deterministic.",
+    }
     state = {
+        "schema_version": 2,
         "model": model.state_dict(),
         "config": vars(model.config),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "rng": get_rng(),
         "step": step,
+        "epoch_fraction": epoch_fraction,
+        "last_train_loss": last_loss,
+        "scheduler": schedule_state,
         "signature": signature,
         "manifest_sha256": signature["manifest_sha256"],
     }
+    snapshot_path = run / f"step_{step:07d}.pt"
+    tmp_snapshot = snapshot_path.with_suffix(".pt.tmp")
+    if snapshot_path.exists():
+        raise FileExistsError(f"Refusing to overwrite checkpoint: {snapshot_path}")
+    torch.save(state, tmp_snapshot)
+    os.replace(tmp_snapshot, snapshot_path)
 
-    checkpoint_file = run / "latest.pt"
-    temporary = run / "latest.tmp"
+    # Link to the SAME immutable snapshot; fallback to a copy on filesystems
+    # that do not support hardlinks. Atomic replacement keeps latest valid.
+    tmp_latest = run / "latest.pt.tmp"
+    if tmp_latest.exists():
+        tmp_latest.unlink()
+    try:
+        os.link(snapshot_path, tmp_latest)
+    except OSError:
+        shutil.copyfile(snapshot_path, tmp_latest)
+    os.replace(tmp_latest, run / "latest.pt")
 
-    torch.save(state, temporary)
-    os.replace(temporary, checkpoint_file)
-
-    snapshot = {
-        k: state[k]
-        for k in (
-            "model",
-            "config",
-            "step",
-            "signature",
-            "manifest_sha256",
-        )
+    info = {
+        "schema_version": 2,
+        "checkpoint_file": snapshot_path.name,
+        "step": step,
+        "epoch_fraction": epoch_fraction,
+        "train_loss": last_loss,
+        "model_config": vars(model.config),
+        "optimizer": {
+            "type": "AdamW", "betas": list(ADAM_BETAS),
+            "weight_decay": WEIGHT_DECAY,
+            "param_groups": [{"lr": g["lr"],
+                              "weight_decay": g["weight_decay"]}
+                             for g in optimizer.param_groups],
+            "state_saved_in_checkpoint": True,
+        },
+        "scheduler": schedule_state,
+        "mixed_precision_scaler_saved": True,
+        "rng_state_saved": True,
+        "training": {k: v for k, v in vars(args).items()
+                     if k not in ("resume", "resume_from", "insertion_metadata", "migrate_legacy_resume")},
+        "dataset_manifest_sha256": signature["manifest_sha256"],
+        "implementation_sha256": signature["implementation_sha256"],
+        "insertion_metadata": signature.get("insertion_metadata"),
+        "insertion_metadata_note": (
+            "Metadata records declared insertion settings; insertion must be"
+            " independently validated against the prepared dataset."),
+        "token_exposure": {
+            "blocks_consumed": step * args.batch * args.accum,
+            "approximate_epochs": epoch_fraction,
+            "prediction_token_slots": step * args.batch * args.accum * args.block_size,
+        },
     }
-
-    torch.save(
-        snapshot,
-        run / f"step_{step:07d}.pt",
-    )
-
-    save_exposures(
-        sampler,
-        run,
-        step,
-        step * args.batch * args.accum,
-    )
-
-    print(f"[SAVE] Checkpoint saved: step {step}", flush=True)
+    _write_json_atomic(snapshot_path.with_suffix(".json"), info)
+    save_exposures(sampler, run, step, step * args.batch * args.accum)
+    print(f"[SAVE] Full checkpoint + metadata: step {step}", flush=True)
 
 
 # ============================================================
@@ -926,8 +997,21 @@ def main():
     signature = {
         k: v
         for k, v in vars(args).items()
-        if k != "resume"
+        if k not in ("resume", "resume_from", "insertion_metadata", "migrate_legacy_resume")
     }
+
+    # Record the exact declared insertion settings alongside this run; do not
+    # mistake this record for proof that the prepared token binaries include it.
+    if args.insertion_metadata is not None:
+        insertion = json.loads(args.insertion_metadata.read_text(encoding="utf-8"))
+        if not isinstance(insertion, dict):
+            raise ValueError("Insertion metadata must be a JSON object")
+        signature["insertion_metadata"] = {
+            "sha256": file_sha(args.insertion_metadata),
+            "content": insertion,
+        }
+    else:
+        signature["insertion_metadata"] = None
 
     signature["manifest_sha256"] = file_sha(
         folder / "manifest.json"
@@ -960,21 +1044,77 @@ def main():
                 flush=True,
             )
 
-            if not checkpoint_file.exists():
-                raise FileNotFoundError(checkpoint_file)
+            resume_path = args.resume_from or checkpoint_file
+            if not resume_path.exists():
+                raise FileNotFoundError(resume_path)
+            fork = resume_path.resolve().parent != run.resolve()
+            if fork:
+                if run.exists():
+                    raise FileExistsError(
+                        f"Fork target run already exists: {run}; choose a new --run")
+                run.mkdir(parents=True)
+            else:
+                # Never overwrite historical snapshots when replaying from an
+                # earlier step. Fork into a NEW run using --resume-from instead.
+                if resume_path.name != 'latest.pt':
+                    latest_state = torch.load(checkpoint_file, map_location='cpu',
+                                              weights_only=True)
+                    if int(latest_state['step']) > int(torch.load(
+                            resume_path, map_location='cpu',
+                            weights_only=True)['step']):
+                        raise ValueError('Older checkpoint selected within same run; '
+                            'use --run NEW_NAME --resume-from OLD_STEP.pt to fork')
 
-            # Load trusted checkpoints only.
+            # Load only your own trusted local checkpoints.
             ckpt = torch.load(
-                checkpoint_file,
+                resume_path,
                 map_location="cpu",
                 weights_only=False,
             )
 
-            if ckpt["signature"] != signature:
+            legacy = ckpt.get("schema_version", 1) < 2
+            if legacy and not all(k in ckpt for k in ('optimizer', 'scaler', 'rng')):
+                raise ValueError('This historical legacy checkpoint has no optimizer state; '
+                                 'it can be evaluated but cannot resume faithfully')
+            if legacy and not args.migrate_legacy_resume:
+                raise ValueError('Legacy checkpoint requires --migrate-legacy-resume '
+                                 'to acknowledge the checkpointing-code migration')
+            expected_signature = dict(ckpt['signature'])
+            if legacy:
+                # Only checkpoint-writing code changed. Explicit migration
+                # permits the train.py digest to update, not model/data/runtime.
+                expected_signature['insertion_metadata'] = signature['insertion_metadata']
+                expected_signature['implementation_sha256'] = dict(
+                    expected_signature['implementation_sha256'])
+                expected_signature['implementation_sha256'][Path(__file__).name] = (
+                    signature['implementation_sha256'][Path(__file__).name])
+            if fork:
+                # Forking changes only the destination run name. All scientific
+                # settings/data/code/precision still have to match exactly.
+                expected_signature['run'] = args.run
+            if expected_signature != signature:
                 raise ValueError(
-                    "Resume signature mismatch: "
-                    "code, dataset, environment or configuration changed"
+                    'Resume signature mismatch: code, dataset, environment '
+                    'or experiment configuration changed'
                 )
+            if legacy:
+                _write_json_atomic(run / 'legacy_checkpoint_migration.json', {
+                    'source_checkpoint': str(resume_path.resolve()),
+                    'source_checkpoint_sha256': file_sha(resume_path),
+                    'old_train_code_sha256': ckpt['signature']['implementation_sha256'].get(Path(__file__).name),
+                    'new_train_code_sha256': signature['implementation_sha256'][Path(__file__).name],
+                    'note': 'Explicit migration only covers checkpoint-writing changes; '
+                            'validate resumed training before scientific use.'
+                })
+                _write_json_atomic(run / 'config.json', signature)
+            if fork:
+                _write_json_atomic(run / 'config.json', signature)
+                _write_json_atomic(run / 'environment.json', runtime_info)
+                _write_json_atomic(run / 'fork_provenance.json', {
+                    'source_checkpoint': str(resume_path.resolve()),
+                    'source_step': int(ckpt['step']),
+                    'source_checkpoint_sha256': file_sha(resume_path),
+                })
 
             with torch.device(device):
                 model = GPT(
@@ -1010,10 +1150,7 @@ def main():
 
             start = 0
 
-            (run / "config.json").write_text(
-                json.dumps(signature, indent=2),
-                encoding="utf-8",
-            )
+            _write_json_atomic(run / "config.json", signature)
 
             (run / "environment.json").write_text(
                 json.dumps(runtime_info, indent=2),
@@ -1088,16 +1225,10 @@ def main():
 
         else:
 
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "config": vars(model.config),
-                    "step": 0,
-                    "signature": signature,
-                    "manifest_sha256": signature["manifest_sha256"],
-                },
-                run / "step_0000000.pt",
-            )
+            # Write the initial checkpoint after optimizer/scaler creation,
+            # ensuring that step zero is also fully resumable.
+            save_checkpoint(model, optimizer, scaler, run, 0, signature,
+                            train, args, last_loss=None)
 
         parameters = sum(
             p.numel() for p in model.parameters()
@@ -1374,6 +1505,7 @@ def main():
                     signature=signature,
                     sampler=train,
                     args=args,
+                    last_loss=total_loss / total_valid,
                 )
 
         print(
