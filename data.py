@@ -22,10 +22,10 @@ def file_sha(path):
     return digest.hexdigest()
 
 
-def verify_data(folder):
+def verify_data(folder, shuffled=False):
     """Validate schema and binary sizes (not complete cryptographic integrity)."""
     folder = Path(folder)
-    m = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
+    m = json.loads((folder / ('manifest_shuffled.json' if shuffled else 'manifest.json')).read_text(encoding='utf-8'))
     expected = {
         'schema_version': 4, 'block_size': BLOCK_SIZE,
         'vocab_size': VOCAB_SIZE, 'eos_token_id': EOS_ID,
@@ -44,13 +44,16 @@ def verify_data(folder):
     for split in ('train', 'val'):
         tokens = int(m[f'{split}_tokens'])
         blocks = int(m[f'{split}_blocks'])
-        path = folder / f'{split}.bin'
+        path = folder / ('train_shuffled.bin' if shuffled and split == 'train' else f'{split}.bin')
         if not path.is_file() or path.stat().st_size != tokens * dtype.itemsize:
             raise ValueError(f'{split}: missing binary or incorrect size')
         if tokens < BLOCK_SIZE + 1 or blocks != (tokens - 1) // BLOCK_SIZE:
             raise ValueError(f'{split}: incorrect number of complete blocks')
-    if not (folder / 'documents.sqlite').is_file():
-        raise FileNotFoundError(folder / 'documents.sqlite')
+    db_name = 'documents_shuffled.sqlite' if shuffled else 'documents.sqlite'
+    if not (folder / db_name).is_file():
+        raise FileNotFoundError(folder / db_name)
+    if shuffled and (m.get('document_shuffled') is not True or m.get('document_shuffle_index') != 'document_order_shuffled.u32'):
+        raise ValueError('Shuffled manifest/document provenance missing')
     if not (folder / 'tokenizer').is_dir():
         raise FileNotFoundError(folder / 'tokenizer')
     return m
@@ -117,16 +120,17 @@ class PackedSampler:
     block_ids accepts a LOGICAL visit offset and returns PHYSICAL IDs.
     """
 
-    def __init__(self, folder, split, block=BLOCK_SIZE, seed=42):
+    def __init__(self, folder, split, block=BLOCK_SIZE, seed=42, shuffled=False):
         self.folder = Path(folder)
         self.split = split
         self.block = int(block)
         self.seed = int(seed)
+        self.shuffled = bool(shuffled)
         if split not in ('train', 'val') or self.block != BLOCK_SIZE or self.seed < 0:
             raise ValueError('Invalid split, block size, or seed')
-        m = verify_data(self.folder)
+        m = verify_data(self.folder, shuffled=self.shuffled)
         self.tokens = np.memmap(
-            self.folder / f'{split}.bin',
+            self.folder / ('train_shuffled.bin' if self.shuffled and split == 'train' else f'{split}.bin'),
             dtype=np.dtype(m['token_dtype']), mode='r'
         )
         self.n_blocks = (len(self.tokens) - 1) // self.block
@@ -135,16 +139,16 @@ class PackedSampler:
         self.permutation = None
         self.inverse_permutation = None
         if split == 'train':
-            order_info = json.loads((self.folder / 'train_chunk_order.json').read_text())
+            order_info = json.loads((self.folder / ('train_chunk_order_shuffled.json' if self.shuffled else 'train_chunk_order.json')).read_text())
             if (order_info['seed'] != self.seed or
                 order_info['n_blocks'] != self.n_blocks or
                 order_info['algorithm'] != SAMPLER_ORDER):
                 raise ValueError('Precomputed chunk order does not match dataset/seed')
-            for filename in ('train_chunk_order.u32', 'train_chunk_inverse.u32'):
+            for filename in (('train_chunk_order_shuffled.u32', 'train_chunk_inverse_shuffled.u32') if self.shuffled else ('train_chunk_order.u32', 'train_chunk_inverse.u32')):
                 if (self.folder / filename).stat().st_size != self.n_blocks * 4:
                     raise ValueError(f'Incorrect precomputed order file size: {filename}')
-            self.permutation = np.memmap(self.folder / 'train_chunk_order.u32', dtype='<u4', mode='r')
-            self.inverse_permutation = np.memmap(self.folder / 'train_chunk_inverse.u32', dtype='<u4', mode='r')
+            self.permutation = np.memmap(self.folder / ('train_chunk_order_shuffled.u32' if self.shuffled else 'train_chunk_order.u32'), dtype='<u4', mode='r')
+            self.inverse_permutation = np.memmap(self.folder / ('train_chunk_inverse_shuffled.u32' if self.shuffled else 'train_chunk_inverse.u32'), dtype='<u4', mode='r')
         self.sampler_order = SAMPLER_ORDER if split == 'train' else 'sequential_validation'
 
     def __len__(self):
@@ -234,7 +238,7 @@ class PackedSampler:
         if max_docs is not None and int(max_docs) < 0:
             raise ValueError('max_docs must be nonnegative')
         limit = None if max_docs is None else int(max_docs)
-        uri = (self.folder / 'documents.sqlite').resolve().as_uri() + '?mode=ro'
+        uri = (self.folder / ('documents_shuffled.sqlite' if self.shuffled else 'documents.sqlite')).resolve().as_uri() + '?mode=ro'
         db = sqlite3.connect(uri, uri=True)
         try:
             cursor = db.execute('''SELECT source_row,token_offset,stored_tokens,
