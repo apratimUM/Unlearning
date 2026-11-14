@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """Four-GPU DDP prepared-Pile GPT-2 Small training with tqdm/ETA.
 
-Launch via torchrun in the supplied Slurm test/production scripts.
-Rank 0 stages model/optimizer snapshots to CPU and writes them asynchronously.
-Only rank 0 creates and locks the run directory; all four ranks synchronize.
-Requires original model.py, data.py and runtime.py unchanged.
-Never resume old DataParallel checkpoints with this script.
 """
 import argparse
 import contextlib
