@@ -1,279 +1,742 @@
+
 #!/usr/bin/env python3
-"""REAL integration checks for the Unlearning project. No dummy model, datasets, or mocks.
+"""Audit schema-v4 Pile data and fixed-order shuffled GPT-2 Small checkpoints.
 
-Requires an existing frozen Pile dataset, genuine saved GPT-2 checkpoints,
-local tokenizer, and optionally real Hugging Face benchmark access. Never trains
-or changes checkpoint weights.
+This is a verifier, NOT the checkpoint writer (train.py writes checkpoints).
+No training, no corpus re-packing, no synthetic data, no model updates.
 
-Example:
- python test_real_pipeline.py --run runs/gpt2_small_pile_full --data data/pile_large \
-   --tasks wikitext lambada blimp --limit 10 --wikitext-max-tokens 2000 \
-   --blimp-configs adjunct_island
+Examples:
+  python checkpoints.py --run runs/gpt2_small_pile_full_1024 --data data/pile_full_1024 --skip-benchmarks
+  python checkpoints.py --run runs/gpt2_small_pile_full_1024 --data data/pile_full_1024 --verify-docs 100
+  python checkpoints.py --run runs/gpt2_small_pile_full_1024 --data data/pile_full_1024 --tasks wikitext --limit 10 --wikitext-max-tokens 2000
+  python checkpoints.py --run runs/gpt2_small_pile_full_1024 --data data/pile_full_1024 --verify-all-offsets
 
-To verify every original document's tokenization: --verify-docs all
-To verify full benchmarks rather than subsets: --limit 0 --wikitext-max-tokens 0
+Document sampling checks SQLite offsets and EOS boundaries against saved binaries.
+Original source-text re-tokenization is NOT possible without source documents;
+this program does not claim to establish original-text equivalence.
 """
 import argparse
-import hashlib
 import json
 import math
-import sys
+import sqlite3
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from data import verify_data, file_sha
+from data import PackedSampler, SAMPLER_ORDER, file_sha, verify_data
 from model import GPT, GPTConfig
-import evaluate
+from runtime import require_cuda
 
 
-def fail(message):
-    raise AssertionError(message)
+def check(test, message):
+    if not test:
+        raise AssertionError(message)
 
 
-def sha_text(text):
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()
-
-
-def assert_true(condition, message):
-    if not condition:
-        fail(message)
-
-
-def parse():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--run', type=Path, required=True, help='Existing run dir containing step_*.pt')
-    p.add_argument('--data', type=Path, required=True, help='Frozen Pile prepared dataset directory')
-    p.add_argument('--insertion-metadata', type=Path, default=None)
-    p.add_argument('--verify-docs', default='20', help='Number of actual prepared docs to check against bin, or all')
-    p.add_argument('--tasks', nargs='+', choices=['wikitext','lambada','blimp','mmlu','all'], default=['wikitext','lambada','blimp'])
-    p.add_argument('--limit', type=int, default=10, help='Per-task sample limit; 0=full')
-    p.add_argument('--wikitext-max-tokens', type=int, default=2000, help='0=full')
+def arguments():
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument('--run', type=Path, required=True)
+    p.add_argument('--data', type=Path, required=True)
+    p.add_argument(
+        '--verify-docs',
+        type=int,
+        default=20,
+        help='Number of real SQLite documents to check across train/val',
+    )
+    p.add_argument(
+        '--verify-all-offsets',
+        action='store_true',
+        help='Stream ALL SQLite records to check contiguous offsets (slow on full Pile)',
+    )
+    p.add_argument(
+        '--forward-all',
+        action='store_true',
+        help='Load and forward-test every checkpoint, not only newest',
+    )
+    p.add_argument('--skip-benchmarks', action='store_true')
+    p.add_argument(
+        '--tasks',
+        nargs='+',
+        choices=['wikitext', 'lambada', 'blimp', 'mmlu', 'all'],
+        default=['wikitext', 'lambada', 'blimp'],
+    )
+    p.add_argument('--limit', type=int, default=10)
+    p.add_argument('--wikitext-max-tokens', type=int, default=2000)
     p.add_argument('--blimp-configs', nargs='*', default=['adjunct_island'])
     p.add_argument('--mmlu-subjects', nargs='*', default=['abstract_algebra'])
-    p.add_argument('--mmlu-shots', type=int, default=0)
+    p.add_argument('--mmlu-shots', type=int, choices=range(6), default=0)
     p.add_argument('--device', default='auto')
-    p.add_argument('--precision', default='float32', choices=['auto','float32','bfloat16','float16'])
-    p.add_argument('--skip-benchmarks', action='store_true', help='Only real checkpoint and frozen Pile tests')
-    p.add_argument('--include-legacy', action='store_true', help='Allow old model-only snapshots for evaluation; no resume assurance')
-    a=p.parse_args()
-    assert_true(a.run.is_dir(), f'Run directory missing: {a.run}')
-    assert_true(a.data.is_dir(), f'Frozen Pile dataset missing: {a.data}')
-    if a.insertion_metadata is not None:
-        assert_true(a.insertion_metadata.is_file(), 'Insertion metadata not found')
-    if a.verify_docs != 'all':
-        assert_true(a.verify_docs.isdigit() and int(a.verify_docs) > 0, '--verify-docs requires positive integer or all')
+    p.add_argument('--gpu', type=int, default=0)
+    p.add_argument('--lambada-max-new-tokens', type=int, default=16)
+    p.add_argument(
+        '--precision',
+        choices=['auto', 'float32', 'bfloat16', 'float16'],
+        default='float32',
+    )
+
+    a = p.parse_args()
+
+    check(a.run.is_dir(), f'Missing run directory: {a.run}')
+    check(a.data.is_dir(), f'Missing dataset directory: {a.data}')
+    check(
+        a.verify_docs >= 0
+        and a.limit >= 0
+        and a.wikitext_max_tokens >= 0
+        and a.gpu >= 0
+        and a.lambada_max_new_tokens > 0,
+        'Limits must be nonnegative',
+    )
+
+    if 'all' in a.tasks:
+        a.tasks = ['wikitext', 'lambada', 'blimp', 'mmlu']
+    else:
+        a.tasks = list(dict.fromkeys(a.tasks))
+
     return a
 
 
-def verify_real_documents(folder, manifest, tok, quantity):
-    """Verify REAL original full_documents.jsonl against frozen binary/index."""
-    originals = folder/'full_documents.jsonl'
-    assert_true(originals.is_file(), f'Missing full documents: {originals}')
-    dtype=np.dtype(manifest['token_dtype'])
-    checked=0
-    for split in ('train','val'):
-        index=json.loads((folder/f'{split}_index.json').read_text())
-        assert_true(index, f'Empty {split}_index')
-        mmap=np.memmap(folder/f'{split}.bin', dtype=dtype, mode='r')
-        # Index integrity is checked for ALL records, not just selected sample.
-        last=-1
-        for record in index:
-            start=int(record['offset']); length=int(record['length'])
-            assert_true(start>=last and length>1 and start+length<=len(mmap),
-                        f'Invalid {split} document token index')
-            last=start+length
-        assert_true(last<=int(manifest['actual_tokens_before_padding'][split]),
-                    f'{split} document boundary exceeds real token stream')
-        del mmap
+def sqlite_connection(folder):
+    return sqlite3.connect(
+        (folder / 'documents.sqlite').resolve().as_uri() + '?mode=ro',
+        uri=True,
+    )
 
-    inds={s:json.loads((folder/f'{s}_index.json').read_text()) for s in ('train','val')}
-    train_n=len(inds['train']); val_n=len(inds['val'])
-    total=train_n+val_n
-    limit=total if quantity=='all' else min(int(quantity),total)
-    # Sample evenly across BOTH train and val, avoiding load of all source texts.
-    choices=set(np.linspace(0,total-1,limit,dtype=np.int64).tolist())
-    data={s:np.memmap(folder/f'{s}.bin',dtype=np.dtype(manifest['token_dtype']),mode='r') for s in inds}
+
+def audit_documents(folder, manifest, amount, exhaustive):
+    """Verify document metadata and actual token boundaries; no source text is stored."""
+    db = sqlite_connection(folder)
+    mmaps = {}
+
     try:
-        seen=0
-        with originals.open(encoding='utf-8') as fh:
-            for i,line in enumerate(fh):
-                if i not in choices:
-                    continue
-                obj=json.loads(line)
-                split=obj['split']; di=int(obj['document_index'])
-                rec=inds[split][di]
-                text=obj['text']
-                assert_true(sha_text(text)==rec['sha256']==obj['document_sha256'],
-                            f'Original document hash mismatch at record {i}')
-                ids=tok.encode(text,add_special_tokens=False)
-                expected=np.asarray(ids+[tok.eos_token_id],dtype=np.int64)
-                stored=np.asarray(data[split][int(rec['offset']):int(rec['offset'])+int(rec['length'])],dtype=np.int64)
-                assert_true(np.array_equal(expected,stored),
-                            f'Frozen Pile token binary mismatch in {split} document {di}')
-                seen+=1
-        assert_true(seen==limit, f'Expected {limit} source documents but checked {seen}')
-        print(f'PASS Pile frozen token binaries correspond to {seen} real, untampered full documents')
+        check(
+            db.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='documents'"
+            ).fetchone(),
+            'SQLite documents table missing',
+        )
+
+        expected_total = 0
+        observed_total = 0
+
+        for split in ('train', 'val'):
+            n_docs, total_tokens, max_end, min_offset = db.execute(
+                """
+                SELECT COUNT(*),
+                       COALESCE(SUM(stored_tokens), 0),
+                       COALESCE(MAX(token_offset + stored_tokens), 0),
+                       COALESCE(MIN(token_offset), 0)
+                FROM documents WHERE split = ?
+                """,
+                (split,),
+            ).fetchone()
+
+            check(
+                n_docs == int(manifest[f'{split}_docs']),
+                f'{split}: document count mismatch',
+            )
+            check(
+                total_tokens == int(manifest[f'{split}_tokens']),
+                f'{split}: document token sum mismatch',
+            )
+            check(
+                max_end == total_tokens and min_offset == 0,
+                f'{split}: document offsets out of bounds',
+            )
+
+            expected_total += int(manifest[f'{split}_docs'])
+            observed_total += n_docs
+
+            mmaps[split] = np.memmap(
+                folder / f'{split}.bin',
+                dtype=np.dtype(manifest['token_dtype']),
+                mode='r',
+            )
+
+            if exhaustive:
+                cursor = 0
+                n = 0
+
+                for offset, text_tokens, stored in db.execute(
+                    """
+                    SELECT token_offset, text_tokens, stored_tokens
+                    FROM documents
+                    WHERE split = ?
+                    ORDER BY token_offset
+                    """,
+                    (split,),
+                ):
+                    check(
+                        offset == cursor
+                        and stored == text_tokens + 1
+                        and stored >= 1,
+                        f'{split}: non-contiguous or invalid document at index {n}',
+                    )
+                    check(
+                        int(mmaps[split][offset + stored - 1]) == 50256,
+                        f'{split}: missing document EOS at record {n}',
+                    )
+                    cursor += stored
+                    n += 1
+
+                check(
+                    cursor == total_tokens and n == n_docs,
+                    f'{split}: full offset scan failed',
+                )
+                print(
+                    f'[PASS] {split}: fully scanned '
+                    f'{n:,} document offsets/EOS markers'
+                )
+            else:
+                print(
+                    f'[PASS] {split}: {n_docs:,} documents, '
+                    f'{total_tokens:,} tokens (aggregate metadata)'
+                )
+
+        check(
+            expected_total == int(manifest['documents_seen']) == observed_total,
+            'Source row count inconsistent with manifest',
+        )
+        check(
+            db.execute('SELECT COUNT(*) FROM documents').fetchone()[0]
+            == expected_total,
+            'SQLite total row count mismatch',
+        )
+
+        lo, hi = db.execute(
+            'SELECT MIN(source_row), MAX(source_row) FROM documents'
+        ).fetchone()
+
+        check(
+            lo == 0 and hi == expected_total - 1,
+            'Source row ID endpoints mismatch',
+        )
+
+        # Sample evenly across original source-row IDs.
+        selected = (
+            sorted(set(int(x) for x in np.linspace(
+                0,
+                expected_total - 1,
+                min(amount, expected_total),
+                dtype=np.int64,
+            )))
+            if amount else []
+        )
+
+        for row_id in selected:
+            record = db.execute(
+                """
+                SELECT split, token_offset, text_tokens,
+                       stored_tokens, text_sha256
+                FROM documents
+                WHERE source_row = ?
+                """,
+                (row_id,),
+            ).fetchone()
+
+            check(record is not None, f'Missing source row {row_id}')
+
+            split, offset, text_tokens, stored, digest = record
+
+            check(
+                split in ('train', 'val')
+                and offset >= 0
+                and text_tokens >= 0,
+                f'Invalid document metadata at source row {row_id}',
+            )
+            check(
+                stored == text_tokens + 1
+                and offset + stored <= len(mmaps[split]),
+                f'Invalid stored token extent at source row {row_id}',
+            )
+            check(
+                int(mmaps[split][offset + stored - 1]) == 50256,
+                f'No EOS after source row {row_id}',
+            )
+            check(
+                isinstance(digest, str) and len(digest) == 64,
+                f'Invalid document hash metadata at source row {row_id}',
+            )
+
+        print(
+            f'[PASS] Verified {len(selected)} sampled real '
+            f'document boundaries and EOS tokens'
+        )
+        print(
+            '[NOTE] Original-text hashes cannot be authenticated '
+            'without fetching the original source text'
+        )
+
     finally:
-        for value in data.values():
-            value._mmap.close()
-    return train_n, val_n
+        db.close()
+        for mmap in mmaps.values():
+            mmap._mmap.close()
 
 
-def verify_insertions(folder, manifest, metadata, tok):
-    """Verify declared inserted text actually appears in corresponding prepared docs."""
-    assert_true(isinstance(metadata,dict), 'Invalid insertion metadata')
-    records=metadata.get('insertions',[])
-    targets=metadata.get('targets',[])
-    assert_true(records and targets, 'Insertion metadata has no targets/insertions')
-    assert_true(len(records)==int(metadata['total_insertions']), 'Insertion count metadata mismatch')
-    by_index={}
-    for record in records:
-        idx=int(record['output_document_index'])
-        by_index.setdefault(idx,[]).append(record)
-    found=set()
-    with (folder/'full_documents.jsonl').open(encoding='utf-8') as fh:
-        for obj in map(json.loads,fh):
-            # When prepared from modified_dataset.jsonl, source_row equals original insertion output index.
-            if obj['split']!='train':
-                continue
-            source_row=obj.get('source_row')
-            if source_row is None:
-                continue
-            idx=int(source_row)
-            if idx not in by_index:
-                continue
-            text=obj['text']
-            for record in by_index[idx]:
-                span=record['inserted_span']
-                start=int(record['inserted_start_char']); end=int(record['inserted_end_char'])
-                assert_true(text[start:end]==span,
-                            f'Inserted target absent at recorded position for document {idx}')
-                found.add((idx,start,end,span))
-    expected={(int(r['output_document_index']),int(r['inserted_start_char']),
-               int(r['inserted_end_char']),r['inserted_span']) for r in records}
-    # A modified input with 50000 train and 2500 validation docs must not place
-    # training-controlled insertions in validation (leakage).
-    assert_true(found==expected,
-                f'Insertion mismatch: {len(expected-found)} missing from train; '
-                f'{len(found)} of {len(expected)} verified. Check source_row mapping, '
-                'train/val split, and modified JSONL actually passed to prepare.py.')
-    print(f'PASS {len(found)} actual inserted spans found at exact positions in Pile TRAIN documents')
+def audit_sampler(folder, manifest, seed, sample_count=512):
+    """Validate the saved block order and reversible exposure mapping.
+
+    Spot-checks visit positions using the precomputed on-disk permutation.
+    Validates train bijection locally and sequential held-out validation.
+    """
+    train = PackedSampler(folder, 'train', int(manifest['block_size']), seed)
+    val = PackedSampler(folder, 'val', int(manifest['block_size']), seed + 100)
+    try:
+        check(train.sampler_order == SAMPLER_ORDER,
+              'Training sampler algorithm does not match expected precomputed-order version')
+        check(val.sampler_order == 'sequential_validation',
+              'Validation sampler must be sequential')
+        check(train.n_blocks == int(manifest['train_blocks']),
+              'Training block count differs from manifest')
+        check(val.n_blocks == int(manifest['val_blocks']),
+              'Validation block count differs from manifest')
+
+        for sampler in (train, val):
+            n = sampler.n_blocks
+            count = min(sample_count, n)
+            # Include both start and end, plus distributed positions throughout.
+            positions = sorted({*range(count), *(n - i - 1 for i in range(count)),
+                                *(int(x) for x in np.linspace(0, n - 1, count))})
+            mapped = [sampler.physical_block_id(i) for i in positions]
+            check(len(mapped) == len(set(mapped)),
+                  f'{sampler.split}: two sampled visits mapped to the same block')
+            for visit, physical in zip(positions, mapped):
+                check(0 <= physical < n, f'{sampler.split}: block out of bounds')
+                check(sampler.logical_block_id(physical) == visit,
+                      f'{sampler.split}: reverse sampler mapping failed at visit {visit}')
+                check(sampler.block_ids(visit, 1) == [physical],
+                      f'{sampler.split}: block_ids disagrees with physical_block_id')
+            check(sampler.block_ids(n, 1) == [], f'{sampler.split}: sampler wraps')
+            check(sampler.block_ids(n - 1, 10) == [sampler.physical_block_id(n - 1)],
+                  f'{sampler.split}: final partial batch wraps')
+            check(len(sampler.block_ids(0, n if n < 1024 else 1024)) == min(n, 1024),
+                  f'{sampler.split}: first batch length mismatch')
+            if sampler.split == 'val':
+                check(mapped == positions, 'Validation block order changed')
+            print(f'[PASS] {sampler.split}: {len(positions)} sampled visits '
+                  'are unique, reversible and non-wrapping')
+
+        # A physical training block is exposed precisely when its visit index
+        # falls before the checkpoint's committed blocks_consumed cursor.
+        check(train.exposure_counts(train.block_ids(0, 1), 0)
+              == {train.physical_block_id(0): 0}, 'Initial exposure incorrect')
+        for consumed in sorted({0, 1, train.n_blocks // 3,
+                                train.n_blocks // 2, train.n_blocks}):
+            visits = sorted({0, min(consumed, train.n_blocks - 1),
+                             max(0, consumed - 1), train.n_blocks - 1})
+            physical = [train.physical_block_id(i) for i in visits]
+            counts = train.exposure_counts(physical, consumed)
+            for visit, block in zip(visits, physical):
+                check(counts[block] == int(visit < consumed),
+                      'Shuffled exposure status differs from actual visitation order')
+        print(f'[PASS] Training exposure lookup matches {SAMPLER_ORDER}; seed={seed}')
+        print('[NOTE] Permutation spot-checks are not a full enumeration of the Pile')
+    finally:
+        train.close()
+        val.close()
 
 
-def verify_checkpoint(path, manifest_digest, dataset_dir, config_signature=None,
-                      insertion_file=None, include_legacy=False):
-    state=torch.load(path,map_location='cpu',weights_only=True)
-    assert_true(isinstance(state,dict),f'Invalid checkpoint: {path}')
-    for key in ('model','config','step','signature','manifest_sha256'):
-        assert_true(key in state,f'Missing {key} in {path}')
-    assert_true(state['manifest_sha256']==manifest_digest,
-                f'Checkpoint dataset hash does not match frozen Pile: {path}')
-    sig=state['signature']
-    assert_true(Path(sig['data']).resolve()==dataset_dir.resolve(),
-                f'Checkpoint {path} was trained on DIFFERENT data directory: {sig["data"]}')
-    if config_signature is not None:
-        assert_true(sig==config_signature,f'Checkpoint signatures differ: {path}')
-    if insertion_file:
-        assert_true(sig.get('insertion_metadata') is not None, 'Insertion run checkpoint has no insertion metadata')
-        assert_true(sig['insertion_metadata']['sha256']==file_sha(insertion_file),
-                    'Checkpoint insertion metadata hash does not match supplied insertion file')
-        assert_true(sig['insertion_metadata']['content']==json.loads(insertion_file.read_text()),
-                    'Checkpoint insertion metadata contents differ')
-    model=GPT(GPTConfig(**state['config']))
-    model.load_state_dict(state['model'],strict=True)
-    model.eval()
-    # Verify restored model computes real logits and exactly matches stored values.
-    dtype=np.dtype(json.loads((dataset_dir/'manifest.json').read_text())['token_dtype'])
-    tokens=np.memmap(dataset_dir/'val.bin',dtype=dtype,mode='r')
-    ids=torch.tensor(np.asarray(tokens[:min(model.config.block_size,16)],dtype=np.int64).copy())[None]
-    del tokens
-    with torch.inference_mode():
-        logits,_=model(ids)
-    assert_true(logits.shape==(1,ids.size(1),model.config.vocab_size) and torch.isfinite(logits).all(),
-                f'Restored checkpoint forward pass fails: {path}')
-    # Full optimizer/scaler/schedule/RNG required for seamless resume.
-    full=all(x in state for x in ('optimizer','scaler','rng','scheduler'))
-    if not full:
-        assert_true(include_legacy,f'Old model-only checkpoint cannot fully resume: {path}')
-    else:
-        optimizer=torch.optim.AdamW([{'params':[p for p in model.parameters() if p.ndim>=2], 'weight_decay':0.1},
-                                     {'params':[p for p in model.parameters() if p.ndim<2], 'weight_decay':0.0}],
-                                    lr=float(sig['lr']), betas=(0.9,0.95))
-        optimizer.load_state_dict(state['optimizer'])
-        if state['step']>0:
-            assert_true(len(optimizer.state)>0,f'No AdamW moments in checkpoint at step {state["step"]}')
-        assert_true(state['scheduler']['completed_optimizer_steps']==state['step'],
-                    f'Incorrect schedule position: {path}')
-        assert_true(set(state['rng'])=={'python','numpy','torch','cuda'},
-                    f'Incomplete RNG state: {path}')
-    card=path.with_suffix('.json')
-    if full:
-        assert_true(card.exists(),f'Missing per-step JSON metadata: {card}')
-        meta=json.loads(card.read_text())
-        assert_true(meta['step']==state['step'] and meta['model_config']==state['config'],
-                    f'Checkpoint JSON does not match checkpoint: {path}')
-        assert_true(meta.get('insertion_metadata')==sig.get('insertion_metadata'),
-                    f'JSON insertion knobs differ from checkpoint signature: {card}')
-    print(f'PASS step={state["step"]} loaded real GPT-2, forward scored frozen Pile tokens, '
-          f'optimizer/scheduler/RNG={"complete" if full else "legacy missing"}, metadata={card.exists()}')
-    return state
+def load_saved(path):
+    # Safe loading supports the RNG representation written by train.py.
+    return torch.load(
+        path,
+        map_location='cpu',
+        weights_only=True,
+    )
+
+
+def audit_checkpoint(
+    path,
+    manifest,
+    digest,
+    folder,
+    device,
+    reference_signature=None,
+    test_forward=False,
+):
+    """Verify checkpoint contents, data identity and optimizer-step cursor."""
+    s = load_saved(path)
+
+    check(isinstance(s, dict), f'{path}: checkpoint must be a dict')
+
+    needed = (
+        'schema_version', 'model', 'config', 'optimizer',
+        'scaler', 'rng', 'scheduler', 'step',
+        'signature', 'manifest_sha256', 'blocks_consumed',
+    )
+    check(
+        all(k in s for k in needed),
+        f'{path}: missing full-state checkpoint keys',
+    )
+    check(
+        int(s['schema_version']) == 3,
+        f'{path}: expected checkpoint schema 3',
+    )
+    check(
+        s['manifest_sha256'] == digest,
+        f'{path}: manifest checksum mismatch',
+    )
+
+    sig = s['signature']
+    check(sig.get('sampler_order') == SAMPLER_ORDER,
+          f'{path}: checkpoint sampler order differs from shuffled data.py')
+    check(int(sig.get('sampler_seed', -1)) == int(sig['seed']),
+          f'{path}: sampler seed differs from training seed')
+
+    check(
+        sig['manifest_sha256'] == digest,
+        f'{path}: signature manifest mismatch',
+    )
+    check(
+        Path(sig['data']).resolve() == folder.resolve(),
+        f'{path}: checkpoint was trained on a different data directory',
+    )
+    check(
+        reference_signature is None or sig == reference_signature,
+        f'{path}: historical checkpoint configuration differs',
+    )
+
+    cfg = s['config']
+
+    check(
+        cfg['block_size'] == manifest['block_size']
+        and cfg['vocab_size'] == manifest['vocab_size']
+        and (
+            cfg['n_layer'],
+            cfg['n_head'],
+            cfg['n_embd'],
+        ) == (12, 12, 768)
+        and math.isclose(float(cfg['dropout']), 0.0, abs_tol=1e-12),
+        f'{path}: model configuration is not GPT-2 Small / 1024 / dropout 0.0',
+    )
+
+    step = int(s['step'])
+
+    check(
+        step >= 0 and path.stem == f'step_{step:07d}',
+        f'{path}: checkpoint filename/step mismatch',
+    )
+
+    effective = int(sig['batch']) * int(sig['accum'])
+
+    check(
+        effective > 0 and int(manifest['train_blocks']) > 0,
+        f'{path}: invalid batch size or train block count',
+    )
+
+    capacity = math.ceil(
+        int(manifest['train_blocks']) / effective
+    )
+
+    check(
+        0 <= step <= int(sig['steps']) <= capacity,
+        f'{path}: training steps exceed one-pass budget',
+    )
+
+    consumed = min(
+        step * effective,
+        int(manifest['train_blocks']),
+    )
+
+    check(
+        int(s['blocks_consumed']) == consumed,
+        f'{path}: block cursor mismatch',
+    )
+
+    check(
+        math.isclose(
+            float(s['epoch_fraction']),
+            consumed / int(manifest['train_blocks']),
+            abs_tol=1e-12,
+        ),
+        f'{path}: epoch fraction mismatch',
+    )
+
+    check(
+        s['scheduler']['completed_optimizer_steps'] == step
+        and s['scheduler']['next_step_index'] == step,
+        f'{path}: scheduler cursor mismatch',
+    )
+
+    check(
+        set(s['rng']) == {'python', 'numpy', 'torch', 'cuda'},
+        f'{path}: RNG state incomplete',
+    )
+
+    check(
+        isinstance(s['optimizer'], dict)
+        and 'state' in s['optimizer']
+        and 'param_groups' in s['optimizer'],
+        f'{path}: optimizer state invalid',
+    )
+
+    if step > 0:
+        check(
+            bool(s['optimizer']['state']),
+            f'{path}: missing AdamW moments after training',
+        )
+
+    card = path.with_suffix('.json')
+
+    check(
+        card.is_file(),
+        f'{path}: missing JSON checkpoint metadata',
+    )
+
+    meta = json.loads(
+        card.read_text(encoding='utf-8')
+    )
+
+    check(
+        meta['step'] == step
+        and meta['model_config'] == cfg,
+        f'{path}: checkpoint JSON mismatch',
+    )
+    check(
+        meta['dataset_manifest_sha256'] == digest,
+        f'{path}: JSON dataset manifest mismatch',
+    )
+
+    exposure = meta['token_exposure']
+
+    check(
+        int(exposure['blocks_consumed']) == consumed
+        and int(exposure['unique_blocks_visited']) == consumed
+        and int(exposure['dataset_blocks'])
+        == int(manifest['train_blocks']),
+        f'{path}: JSON exposure mismatch',
+    )
+
+    # Exact sampler-order value from final train.py.
+    check(
+        exposure['sampler_order']
+        == SAMPLER_ORDER,
+        f'{path}: sampler order differs from final train.py',
+    )
+
+    check(int(exposure['prediction_tokens']) == consumed * int(manifest['block_size']),
+          f'{path}: prediction token accounting mismatch')
+    check(math.isclose(float(exposure['epochs']), consumed / int(manifest['train_blocks']),
+                       rel_tol=1e-10, abs_tol=1e-12),
+          f'{path}: reported epoch fraction differs')
+    if test_forward:
+        # Model computation must take place on CUDA.
+        model = GPT(
+            GPTConfig(**cfg)
+        )
+
+        model.load_state_dict(
+            s['model'],
+            strict=True,
+        )
+
+        model.to(device).eval()
+
+        mmap = np.memmap(
+            folder / 'val.bin',
+            dtype=np.dtype(manifest['token_dtype']),
+            mode='r',
+        )
+
+        try:
+            ids = torch.tensor(
+                np.asarray(
+                    mmap[:16],
+                    dtype=np.int64,
+                ).copy(),
+                dtype=torch.long,
+                device=device,
+            )[None]
+        finally:
+            mmap._mmap.close()
+
+        with torch.inference_mode():
+            logits, _ = model(ids)
+
+        check(
+            logits.shape == (
+                1, 16, model.config.vocab_size
+            )
+            and torch.isfinite(logits).all(),
+            f'{path}: model forward output invalid',
+        )
+
+        print(
+            f'[PASS] Actual restored model forward '
+            f'on {device}: {path.name}'
+        )
+
+        del model, logits, ids
+
+    print(
+        f'[PASS] step={step:,}: full-state checkpoint, JSON, '
+        f'cursor, manifest, optimizer, RNG'
+    )
+
+    return sig, step
+
+
+def run_benchmarks(args, checkpoint):
+    """Evaluate a historical checkpoint using the final evaluate.py API."""
+    import evaluate
+    from argparse import Namespace
+
+    options = Namespace(
+        checkpoint=checkpoint,
+        all_checkpoints=False,
+        tasks=args.tasks,
+        tokenizer=str(args.data / 'tokenizer'),
+        gpu=args.gpu,
+        device=args.device,
+        precision=args.precision,
+        limit=args.limit,
+        wikitext_max_tokens=args.wikitext_max_tokens,
+        stride=0,
+        blimp_configs=args.blimp_configs,
+        mmlu_subjects=args.mmlu_subjects,
+        mmlu_shots=args.mmlu_shots,
+        lambada_max_new_tokens=args.lambada_max_new_tokens,
+        output=None,
+        local_files_only=True,
+        trusted_checkpoint=False,
+    )
+
+    path = evaluate.evaluate_one(options)
+
+    output = json.loads(
+        path.read_text(encoding='utf-8')
+    )
+
+    check(
+        output['step']
+        == int(checkpoint.stem.split('_')[-1]),
+        'Benchmark checkpoint step mismatch',
+    )
+
+    for task in args.tasks:
+        result = output['results'][task]
+
+        metric = result.get(
+            'perplexity',
+            result.get('accuracy'),
+        )
+
+        check(
+            metric is not None
+            and math.isfinite(float(metric)),
+            f'Nonfinite {task} benchmark metric',
+        )
+
+    print(
+        f'[PASS] Real benchmark evaluation: {checkpoint.name}'
+    )
 
 
 def main():
-    a=parse()
-    manifest=verify_data(a.data)
-    digest=file_sha(a.data/'manifest.json')
-    print(f'PASS frozen Pile manifest+all declared artifact SHA256 hashes verified: {a.data}')
-    from transformers import AutoTokenizer
-    tok=AutoTokenizer.from_pretrained(a.data/'tokenizer',use_fast=True,local_files_only=True)
-    assert_true(tok.is_fast and tok.eos_token_id is not None,'Saved tokenizer is missing fast offsets/EOS')
-    train_n,val_n=verify_real_documents(a.data,manifest,tok,a.verify_docs)
-    print(f'PASS documented Pile data: train_docs={train_n}, val_docs={val_n}, block_size={manifest["block_size"]}')
-    snapshots=sorted(a.run.glob('step_*.pt'))
-    assert_true(snapshots,f'No real saved step_*.pt checkpoints in {a.run}')
-    signature=None
-    for checkpoint in snapshots:
-        state=verify_checkpoint(checkpoint,digest,a.data,signature,a.insertion_metadata,a.include_legacy)
-        if signature is None: signature=state['signature']
-    newest=max(snapshots,key=lambda p:int(p.stem.split('_')[-1]))
-    latest=a.run/'latest.pt'
-    assert_true(latest.exists(),'Missing latest.pt')
-    latest_state=torch.load(latest,map_location='cpu',weights_only=True)
-    newest_state=torch.load(newest,map_location='cpu',weights_only=True)
-    assert_true(latest_state['step']==newest_state['step'],'latest.pt does not point to newest checkpoint')
-    assert_true(all(torch.equal(latest_state['model'][k],newest_state['model'][k]) for k in newest_state['model']),
-                'latest.pt model differs from last historical checkpoint')
-    print(f'PASS latest.pt matches newest saved model step={latest_state["step"]}')
-    if a.insertion_metadata:
-        verify_insertions(a.data,manifest,json.loads(a.insertion_metadata.read_text()),tok)
-    elif signature.get('insertion_metadata'):
-        print('WARNING: insertion experiment detected; supply --insertion-metadata to verify actual inserted text')
-    if not a.skip_benchmarks:
-        # Run actual evaluator with actual HF benchmark data for every checkpoint.
-        tasks=['wikitext','lambada','blimp','mmlu'] if 'all' in a.tasks else a.tasks
+    args = arguments()
+
+    # Require CUDA for every checkpoint-audit run.
+    # Loading, JSON and SQLite operations remain CPU/disk tasks.
+    device = require_cuda(args.gpu)
+
+    if args.device not in (
+        'auto', 'cuda', f'cuda:{args.gpu}'
+    ):
+        raise ValueError(
+            '--device must be auto, cuda, '
+            'or cuda:<selected --gpu>'
+        )
+
+    manifest = verify_data(args.data)
+    digest = file_sha(
+        args.data / 'manifest.json'
+    )
+
+    print(
+        '[PASS] Schema-v4 manifest and train/val file lengths verified'
+    )
+    print(
+        '[NOTE] The binaries are not cryptographically verified '
+        'by the schema-v4 manifest'
+    )
+
+    audit_documents(
+        args.data,
+        manifest,
+        args.verify_docs,
+        args.verify_all_offsets,
+    )
+
+    snapshots = sorted(
+        args.run.glob('step_*.pt'),
+        key=lambda p: int(p.stem.split('_')[-1])
+    )
+
+    check(
+        snapshots,
+        'No historical step_*.pt checkpoints',
+    )
+
+    signature = None
+    previous_step = -1
+
+    for i, path in enumerate(snapshots):
+        current, step = audit_checkpoint(
+            path,
+            manifest,
+            digest,
+            args.data,
+            device,
+            signature,
+            test_forward=(
+                args.forward_all
+                or i == len(snapshots) - 1
+            ),
+        )
+
+        check(step > previous_step, 'Checkpoint steps not strictly increasing')
+        previous_step = step
+        if signature is None:
+            signature = current
+
+    check(
+        signature is not None,
+        'No checkpoint signature',
+    )
+
+    audit_sampler(
+        args.data,
+        manifest,
+        int(signature['seed']),
+    )
+
+    latest = args.run / 'latest.pt'
+
+    check(
+        latest.is_file(),
+        'latest.pt is missing',
+    )
+
+    # Verify latest.pt matches the newest immutable snapshot.
+    check(
+        file_sha(latest) == file_sha(snapshots[-1]),
+        'latest.pt does not match newest historical checkpoint byte-for-byte',
+    )
+
+    print(
+        '[PASS] latest.pt matches the newest historical snapshot exactly'
+    )
+
+    if not args.skip_benchmarks:
         for checkpoint in snapshots:
-            options=argparse.Namespace(checkpoint=checkpoint,tasks=tasks,tokenizer=str(a.data/'tokenizer'),
-                device=a.device,precision=a.precision,limit=a.limit,
-                wikitext_max_tokens=a.wikitext_max_tokens,stride=0,
-                blimp_configs=a.blimp_configs,mmlu_subjects=a.mmlu_subjects,
-                mmlu_shots=a.mmlu_shots,output=None,local_files_only=True,
-                trusted_checkpoint=False,all_checkpoints=False)
-            output=evaluate.evaluate_one(options)
-            results=json.loads(output.read_text())
-            assert_true(results['step']==int(checkpoint.stem.split('_')[-1]),
-                        'Benchmark JSON has wrong checkpoint step')
-            for task in tasks:
-                value=results['results'][task].get('perplexity',results['results'][task].get('accuracy'))
-                assert_true(value is not None and math.isfinite(value),f'Nonfinite real {task} score')
-            print(f'PASS real benchmark datasets + JSON output for step {results["step"]}')
-    print('ALL REQUESTED REAL-ARTIFACT CHECKS PASSED')
+            run_benchmarks(args, checkpoint)
+
+    print('ALL REQUESTED CHECKS PASSED')
 
 
-if __name__=='__main__':
-    try:
-        main()
-    except Exception as exc:
-        print(f'FAIL REAL PIPELINE: {type(exc).__name__}: {exc}',file=sys.stderr)
-        raise
+if __name__ == '__main__':
+    main()
