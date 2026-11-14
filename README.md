@@ -12,7 +12,7 @@ Code for training GPT-2 Small from scratch on the deduplicated Pile, with a sepa
 | `runtime.py` | Provides CUDA, mixed-precision, and optimizer-step utilities. |
 | `train.py` | Trains with four-GPU DDP, handles block ordering, evaluation, logging, checkpoints, and resume. |
 | `token.sbatch` | Launches training on Frances and handles graceful checkpoint-and-resubmit between Slurm jobs. |
-| `evaluate.py` | Evaluates checkpoints on WikiText-103, LAMBADA, BLiMP, and MMLU. |
+| `evaluation.py` | Evaluates checkpoints on WikiText-103, LAMBADA, BLiMP, and MMLU. |
 | `checkpoints.py` | Checks dataset and checkpoint consistency and can invoke benchmark evaluation. |
 | `requirements.txt` | Lists Python dependencies. |
 
