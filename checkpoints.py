@@ -96,16 +96,16 @@ def arguments():
     return a
 
 
-def sqlite_connection(folder):
+def sqlite_connection(folder, shuffled=False):
     return sqlite3.connect(
-        (folder / 'documents.sqlite').resolve().as_uri() + '?mode=ro',
+        (folder / ('documents_shuffled.sqlite' if shuffled else 'documents.sqlite')).resolve().as_uri() + '?mode=ro',
         uri=True,
     )
 
 
-def audit_documents(folder, manifest, amount, exhaustive):
+def audit_documents(folder, manifest, amount, exhaustive, shuffled=False):
     """Verify document metadata and actual token boundaries; no source text is stored."""
-    db = sqlite_connection(folder)
+    db = sqlite_connection(folder, shuffled=shuffled)
     mmaps = {}
 
     try:
@@ -149,7 +149,7 @@ def audit_documents(folder, manifest, amount, exhaustive):
             observed_total += n_docs
 
             mmaps[split] = np.memmap(
-                folder / f'{split}.bin',
+                folder / ('train_shuffled.bin' if shuffled and split == 'train' else f'{split}.bin'),
                 dtype=np.dtype(manifest['token_dtype']),
                 mode='r',
             )
@@ -274,14 +274,14 @@ def audit_documents(folder, manifest, amount, exhaustive):
             mmap._mmap.close()
 
 
-def audit_sampler(folder, manifest, seed, sample_count=512):
+def audit_sampler(folder, manifest, seed, sample_count=512, shuffled=False):
     """Validate the saved block order and reversible exposure mapping.
 
     Spot-checks visit positions using the precomputed on-disk permutation.
     Validates train bijection locally and sequential held-out validation.
     """
-    train = PackedSampler(folder, 'train', int(manifest['block_size']), seed)
-    val = PackedSampler(folder, 'val', int(manifest['block_size']), seed + 100)
+    train = PackedSampler(folder, 'train', int(manifest['block_size']), seed, shuffled=shuffled)
+    val = PackedSampler(folder, 'val', int(manifest['block_size']), seed + 100, shuffled=shuffled)
     try:
         check(train.sampler_order == SAMPLER_ORDER,
               'Training sampler algorithm does not match expected precomputed-order version')
@@ -381,6 +381,8 @@ def audit_checkpoint(
     sig = s['signature']
     check(sig.get('sampler_order') == SAMPLER_ORDER,
           f'{path}: checkpoint sampler order differs from shuffled data.py')
+    check(bool(sig.get('shuffled', False)) == (manifest.get('document_shuffled') is True),
+          f'{path}: checkpoint shuffled selection differs from audited manifest')
     check(int(sig.get('sampler_seed', -1)) == int(sig['seed']),
           f'{path}: sampler seed differs from training seed')
 
@@ -648,9 +650,15 @@ def main():
             'or cuda:<selected --gpu>'
         )
 
-    manifest = verify_data(args.data)
+    snapshots = sorted(
+        args.run.glob('step_*.pt'),
+        key=lambda p: int(p.stem.split('_')[-1])
+    )
+    check(snapshots, 'No historical step_*.pt checkpoints')
+    shuffled = bool(load_saved(snapshots[0])['signature'].get('shuffled', False))
+    manifest = verify_data(args.data, shuffled=shuffled)
     digest = file_sha(
-        args.data / 'manifest.json'
+        args.data / ('manifest_shuffled.json' if shuffled else 'manifest.json')
     )
 
     print(
@@ -666,16 +674,7 @@ def main():
         manifest,
         args.verify_docs,
         args.verify_all_offsets,
-    )
-
-    snapshots = sorted(
-        args.run.glob('step_*.pt'),
-        key=lambda p: int(p.stem.split('_')[-1])
-    )
-
-    check(
-        snapshots,
-        'No historical step_*.pt checkpoints',
+        shuffled=shuffled,
     )
 
     signature = None
@@ -709,6 +708,7 @@ def main():
         args.data,
         manifest,
         int(signature['seed']),
+        shuffled=shuffled,
     )
 
     latest = args.run / 'latest.pt'
