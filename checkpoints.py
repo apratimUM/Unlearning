@@ -2,9 +2,6 @@
 #!/usr/bin/env python3
 """Audit schema-v4 Pile data and fixed-order shuffled GPT-2 Small checkpoints.
 
-This is a verifier, NOT the checkpoint writer (train.py writes checkpoints).
-No training, no corpus re-packing, no synthetic data, no model updates.
-
 Examples:
   python checkpoints.py --run runs/gpt2_small_pile_full_1024 --data data/pile_full_1024 --skip-benchmarks
   python checkpoints.py --run runs/gpt2_small_pile_full_1024 --data data/pile_full_1024 --verify-docs 100
