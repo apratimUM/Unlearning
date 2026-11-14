@@ -5,15 +5,16 @@
 #
 # python train.py --prepare-order \
 #   --data /coe-aroyc/apratim/pile_full_data \
-#   --out /coe-aroyc/apratim/pile_full_docshuf42 \
-#   --seed 42
+#   --out /coe-aroyc/apratim/pile_full_data \
+#   --seed 42 --threads 8
 #
 # This reuses existing token IDs (no retokenization), shuffles documents,
 # forms 1024-token chunks, and saves a fixed shuffled chunk order.
+# Parallel CPU reads and a single ordered writer preserve exact document IDs.
 # Original document IDs and chunk IDs remain traceable through saved metadata.
 #
 # Run this ONLY ONCE for each new dataset/seed. Use --resume if interrupted.
-# After preparation completes, start GPU training using the NEW dataset path.
+# After preparation completes, start GPU training with --shuffled.
 # Do not rerun preparation when resuming training from a checkpoint.
 # No shuffling occurs inside the training batch loop.
 
@@ -358,6 +359,7 @@ def get_args():
     p.add_argument('--check-do-sample', action='store_true', default=True)
     p.add_argument('--check-prompts', nargs='+', default=[
         'Once upon a time', 'The capital of France is', 'Artificial intelligence is'])
+    p.add_argument('--shuffled', action='store_true', help='Train on train_shuffled.bin in the same dataset folder')
     p.add_argument('--resume', action='store_true')
     a = p.parse_args()
     if a.block_size != 1024 or a.batch < 2 or a.accum < 1 or a.steps < 0:
@@ -468,22 +470,22 @@ class CheckpointWriter:
 def ensure_chunk_order(folder, manifest, seed, *, allow_create=False):
     """Verify a saved chunk order; create only in explicit CPU preparation mode."""
     folder = Path(folder)
-    if manifest.get('document_shuffled') is not True or manifest.get('document_shuffle_index') != 'document_order.u32':
+    if manifest.get('document_shuffled') is not True or manifest.get('document_shuffle_index') != 'document_order_shuffled.u32':
         raise RuntimeError('Document shuffle missing: run train.py --prepare-order first')
-    doc_order = folder / 'document_order.u32'
+    doc_order = folder / 'document_order_shuffled.u32'
     if not doc_order.is_file() or doc_order.stat().st_size != 4 * int(manifest['train_docs']):
         raise RuntimeError('Document order file missing or wrong size')
     n = int(manifest['train_blocks'])
     if not 1 <= n < 2**32:
         raise ValueError('Fixed uint32 order requires 1..2**32-1 chunks')
-    paths = [folder / 'train_chunk_order.u32', folder / 'train_chunk_inverse.u32',
-             folder / 'train_chunk_order.json']
+    paths = [folder / 'train_chunk_order_shuffled.u32', folder / 'train_chunk_inverse_shuffled.u32',
+             folder / 'train_chunk_order_shuffled.json']
     present = [path.exists() for path in paths]
     if all(present):
         info = json.loads(paths[2].read_text(encoding='utf-8'))
         if (info.get('algorithm') != SAMPLER_ORDER or info.get('seed') != seed or
                 info.get('n_blocks') != n or
-                info.get('source_manifest_sha256') != file_sha(folder / 'manifest.json')):
+                info.get('source_manifest_sha256') != file_sha(folder / 'manifest_shuffled.json')):
             raise ValueError('Existing fixed chunk order does not match manifest/seed')
         if any(path.stat().st_size != 4*n for path in paths[:2]):
             raise ValueError('Fixed chunk order files have incorrect sizes')
@@ -512,8 +514,8 @@ def ensure_chunk_order(folder, manifest, seed, *, allow_create=False):
                 out.flush()
                 os.fsync(out.fileno())
         info = dict(algorithm=SAMPLER_ORDER, seed=seed, n_blocks=n,
-                    source_manifest='manifest.json',
-                    source_manifest_sha256=file_sha(folder / 'manifest.json'),
+                    source_manifest='manifest_shuffled.json',
+                    source_manifest_sha256=file_sha(folder / 'manifest_shuffled.json'),
                     source_manifest_train_blocks=n)
         with temps[2].open('w', encoding='utf-8') as out:
             json.dump(info, out, indent=2)
@@ -658,9 +660,9 @@ def prepare_document_shuffle(a):
     p = _Parser()
     src = a.data.expanduser().resolve()
     dst = a.out.expanduser().resolve()
-    if src == dst or src in dst.parents or dst in src.parents:
-        p.error('Source and destination must be separate non-nested directories')
-    if a.seed < 0 or a.checkpoint_every <= 0:
+    if src != dst:
+        p.error('This mode writes shuffled files alongside originals: --out must equal --data')
+    if a.seed < 0 or a.checkpoint_every <= 0 or a.threads <= 0 or a.read_batch_docs <= 0:
         p.error('Invalid seed or checkpoint interval')
     if not (src / 'manifest.json').is_file():
         p.error('Source manifest.json not found')
@@ -676,19 +678,19 @@ def prepare_document_shuffle(a):
         p.error('Source train.bin or documents.sqlite missing')
     if (src / 'train.bin').stat().st_size != 2 * int(m['train_tokens']):
         p.error('Source train.bin size disagrees with manifest')
-    if (dst / 'manifest.json').is_file():
-        completed = json.loads((dst / 'manifest.json').read_text())
+    if (dst / 'manifest_shuffled.json').is_file():
+        completed = json.loads((dst / 'manifest_shuffled.json').read_text())
         if (completed.get('document_shuffle_seed') != a.seed or
                 completed.get('document_shuffle_source_manifest_sha256') != sha256_file(src / 'manifest.json')):
             p.error('Completed dataset does not match source/seed')
-        verify_data(dst)
+        verify_data(dst, shuffled=True)
         ensure_chunk_order(dst, completed, a.seed, allow_create=True)
         print('[ORDER] Both saved shuffles already exist; no work needed', flush=True)
         return
-    if dst.exists() and not a.resume:
-        p.error('Output exists: use --resume or a NEW output directory')
-    if not dst.exists() and a.resume:
-        p.error('Cannot resume a missing destination directory')
+    if a.resume and not (dst / 'documents_shuffled.sqlite').exists():
+        p.error('No in-place shuffled SQLite state to resume')
+    if not a.resume and any((dst / name).exists() for name in ('documents_shuffled.sqlite', 'train_shuffled.bin', 'manifest_shuffled.json')):
+        p.error('Shuffled output already exists: use --resume after stopping any existing writer')
     source_hash = sha256_file(src / 'manifest.json')
     print(f'[SOURCE] {n:,} documents, {int(m["train_tokens"]):,} tokens; loading document metadata', flush=True)
     # Fast indexed lookup by original source_row during randomized repacking.
@@ -716,9 +718,7 @@ def prepare_document_shuffle(a):
         print('[INDEX] Source documents are contiguous and complete', flush=True)
         order = np.random.default_rng(a.seed).permutation(n).astype('<u4')
         # Check all expected IDs via the bijection guaranteed by numpy permutation.
-        if not a.resume:
-            dst.mkdir(parents=True, exist_ok=False)
-        db = sqlite3.connect(dst / 'documents.sqlite', timeout=120)
+        db = sqlite3.connect(dst / 'documents_shuffled.sqlite', timeout=120)
         try:
             create_db(db)
             existing = db.execute("SELECT value FROM progress WHERE key='shuffle_state'").fetchone()
@@ -736,66 +736,112 @@ def prepare_document_shuffle(a):
                            ('shuffle_state', json.dumps(state)))
                 db.commit()
             # Output is only finalized when manifest is published.
-            if (dst / 'manifest.json').exists():
+            if (dst / 'manifest_shuffled.json').exists():
                 raise RuntimeError('Destination already finalized; do not shuffle twice')
             next_doc = int(state['next_doc'])
             written = int(state['tokens'])
             count, high = db.execute("SELECT COUNT(*), COALESCE(MAX(token_offset+stored_tokens),0) FROM documents WHERE split='train'").fetchone()
             if count != next_doc or high != written:
                 raise RuntimeError('Output SQLite metadata and progress disagree')
-            output_file = dst / 'train.bin'
+            output_file = dst / 'train_shuffled.bin'
             if next_doc and not output_file.exists():
                 raise RuntimeError('Committed output binary missing')
             if output_file.exists() and output_file.stat().st_size < 2 * written:
                 raise RuntimeError('Output binary shorter than durable checkpoint')
-            source_tokens = np.memmap(src / 'train.bin', dtype='<u2', mode='r')
+            # Random document reads can be high-latency on Turbo.  Read ahead in
+            # parallel using pread (independent offsets on one shared read-only FD),
+            # but WRITE in the original deterministic shuffled-document order.
+            # Only a bounded number of read groups is in flight to cap host RAM.
+            source_fd = os.open(src / 'train.bin', os.O_RDONLY)
             if next_doc == 0 and not output_file.exists():
                 output_file.touch()
-            with output_file.open('r+b', buffering=4 << 20) as output:
-                output.truncate(2 * written)  # discard interrupted, uncommitted writes
-                output.seek(2 * written)
-                start_time = time.monotonic()
-                for batch_start in range(next_doc, n, a.checkpoint_every):
-                    batch_end = min(n, batch_start + a.checkpoint_every)
-                    entries = []
-                    for j in range(batch_start, batch_end):
-                        old_id = int(order[j])
-                        old_offset = int(offsets[old_id])
-                        length = int(stored[old_id])
-                        # Byte-for-byte copy: no tokenizer invocation or EOS insertion.
-                        output.write(source_tokens[old_offset:old_offset + length].tobytes())
-                        entries.append((j, 'train', written, int(textlens[old_id]),
-                                        length, hashes[old_id].decode('ascii')))
-                        written += length
-                    output.flush()
-                    os.fsync(output.fileno())
-                    db.executemany('''INSERT INTO documents
-                        (source_row,split,token_offset,text_tokens,stored_tokens,text_sha256)
-                        VALUES (?,?,?,?,?,?)''', entries)
-                    state['next_doc'], state['tokens'] = batch_end, written
-                    db.execute('UPDATE progress SET value=? WHERE key=?',
-                               (json.dumps(state), 'shuffle_state'))
-                    db.commit()
-                    elapsed = time.monotonic() - start_time
-                    print(f'[SHUFFLE] {batch_end:,}/{n:,} docs; {written:,} tokens; '
-                          f'{(batch_end-next_doc)/max(1,elapsed):.1f} docs/s', flush=True)
-            del source_tokens
+
+            def read_group(begin, end):
+                # Keep futures coarse-grained: one task reads multiple whole docs.
+                # No tokenizer runs; os.pread returns raw stored uint16 token bytes.
+                result = []
+                for j in range(begin, end):
+                    old_id = int(order[j])
+                    byte_count = int(stored[old_id]) * 2
+                    byte_offset = int(offsets[old_id]) * 2
+                    chunks = []
+                    remaining = byte_count
+                    while remaining:
+                        data = os.pread(source_fd, remaining, byte_offset)
+                        if not data:
+                            raise IOError(f'Short read for document {old_id}: {remaining} bytes missing')
+                        chunks.append(data)
+                        byte_offset += len(data)
+                        remaining -= len(data)
+                    result.append(b''.join(chunks))
+                return result
+
+            def ordered_read_groups(pool, begin, end):
+                # Keep a fixed-size queue of concurrently running read tasks;
+                # retrieve futures in sequence to preserve document/chunk IDs.
+                in_flight = deque()
+                next_submit = begin
+                max_in_flight = max(1, 2 * a.threads)
+                def submit_one():
+                    nonlocal next_submit
+                    group_end = min(end, next_submit + a.read_batch_docs)
+                    in_flight.append((next_submit, group_end,
+                                      pool.submit(read_group, next_submit, group_end)))
+                    next_submit = group_end
+                while next_submit < end and len(in_flight) < max_in_flight:
+                    submit_one()
+                while in_flight:
+                    group_begin, group_end, future = in_flight.popleft()
+                    payloads = future.result()  # in original shuffled order
+                    if next_submit < end:
+                        submit_one()
+                    yield group_begin, payloads
+
+            try:
+                print(f'[SHUFFLE] parallel reads: {a.threads} threads, '
+                      f'{a.read_batch_docs} documents/task, '
+                      f'{2*a.threads} tasks max in flight; ordered single writer', flush=True)
+                with ThreadPoolExecutor(max_workers=a.threads, thread_name_prefix='doc-read') as pool:
+                    with output_file.open('r+b', buffering=4 << 20) as output:
+                        output.truncate(2 * written)  # discard interrupted, uncommitted writes
+                        output.seek(2 * written)
+                        start_time = time.monotonic()
+                        for batch_start in range(next_doc, n, a.checkpoint_every):
+                            batch_end = min(n, batch_start + a.checkpoint_every)
+                            entries = []
+                            for group_begin, payloads in ordered_read_groups(pool, batch_start, batch_end):
+                                for j, payload in enumerate(payloads, start=group_begin):
+                                    old_id = int(order[j])
+                                    length = int(stored[old_id])
+                                    if len(payload) != 2 * length:
+                                        raise IOError(f'Unexpected token byte length at source document {old_id}')
+                                    output.write(payload)
+                                    entries.append((j, 'train', written, int(textlens[old_id]),
+                                                    length, hashes[old_id].decode('ascii')))
+                                    written += length
+                            # Preserve the existing durable commit protocol, including --resume.
+                            output.flush()
+                            os.fsync(output.fileno())
+                            db.executemany('''INSERT INTO documents
+                                (source_row,split,token_offset,text_tokens,stored_tokens,text_sha256)
+                                VALUES (?,?,?,?,?,?)''', entries)
+                            state['next_doc'], state['tokens'] = batch_end, written
+                            db.execute('UPDATE progress SET value=? WHERE key=?',
+                                       (json.dumps(state), 'shuffle_state'))
+                            db.commit()
+                            elapsed = time.monotonic() - start_time
+                            print(f'[SHUFFLE] {batch_end:,}/{n:,} docs; {written:,} tokens; '
+                                  f'{(batch_end-next_doc)/max(1,elapsed):.1f} docs/s', flush=True)
+            finally:
+                os.close(source_fd)
             if written != int(m['train_tokens']):
                 raise RuntimeError('Shuffled training token count changed')
             # Persist random visit order of original training-document source IDs.
-            with (dst / 'document_order.u32.tmp').open('wb') as f:
+            with (dst / 'document_order_shuffled.u32.tmp').open('wb') as f:
                 order.tofile(f)
                 f.flush(); os.fsync(f.fileno())
-            os.replace(dst / 'document_order.u32.tmp', dst / 'document_order.u32')
-            # Validation is NEVER shuffled. Preserve exact validation bytes and metadata.
-            src_val_hash = sha256_file(src / 'val.bin')
-            dst_val = dst / 'val.bin'
-            if not dst_val.exists() or sha256_file(dst_val) != src_val_hash:
-                tmp_val = dst / 'val.bin.tmp'
-                shutil.copyfile(src / 'val.bin', tmp_val)
-                if sha256_file(tmp_val) != src_val_hash:
-                    raise RuntimeError('Validation copy checksum failed')
-                os.replace(tmp_val, dst_val)
+            os.replace(dst / 'document_order_shuffled.u32.tmp', dst / 'document_order_shuffled.u32')
+            # Original val.bin and tokenizer remain untouched and are reused in-place.
             already_val = db.execute("SELECT COUNT(*) FROM documents WHERE split='val'").fetchone()[0]
             if already_val == 0:
                 batch = []
@@ -811,12 +857,6 @@ def prepare_document_shuffle(a):
                 db.commit()
             elif already_val != int(m['val_docs']):
                 raise RuntimeError('Partially inserted validation metadata')
-            if not (dst / 'tokenizer').exists():
-                tmp_tok = dst / 'tokenizer.tmp'
-                if tmp_tok.exists():
-                    shutil.rmtree(tmp_tok)
-                shutil.copytree(src / 'tokenizer', tmp_tok)
-                os.replace(tmp_tok, dst / 'tokenizer')
             db.execute('CREATE INDEX IF NOT EXISTS documents_split_offset ON documents(split,token_offset)')
             db.commit()
             manifest = dict(m)
@@ -825,14 +865,14 @@ def prepare_document_shuffle(a):
             manifest.update(document_shuffled=True,
                             document_shuffle_seed=a.seed,
                             document_shuffle_source_manifest_sha256=source_hash,
-                            document_shuffle_index='document_order.u32',
+                            document_shuffle_index='document_order_shuffled.u32',
                             document_shuffle_index_semantics='new_document_position_to_original_source_row',
                             document_shuffle_stage='after_tokenization_before_1024_token_chunking')
             # Existing checkpoint verification works with the new contiguous row IDs.
-            atomic_json(dst / 'manifest.json', manifest)
-            verify_data(dst)
+            atomic_json(dst / 'manifest_shuffled.json', manifest)
+            verify_data(dst, shuffled=True)
             ensure_chunk_order(dst, manifest, a.seed, allow_create=True)
-            print(f'[DONE] Both document and fixed chunk ordering ready: {dst}', flush=True)
+            print(f'[DONE] Same-folder document and fixed chunk order ready: {dst}', flush=True)
         finally:
             db.close()
     finally:
@@ -844,11 +884,15 @@ def preparation_cli():
     p = argparse.ArgumentParser(description='One-time CPU preparation of document + chunk shuffles')
     p.add_argument('--prepare-order', action='store_true', required=True)
     p.add_argument('--data', type=Path, required=True, help='Existing ordered, tokenized source dataset')
-    p.add_argument('--out', type=Path, required=True, help='New shuffled dataset directory')
+    p.add_argument('--out', type=Path, default=None, help='Must equal --data (same-folder shuffled files)')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--checkpoint-every', type=int, default=20_000)
+    p.add_argument('--threads', type=int, default=8, help='Concurrent CPU read threads for Turbo I/O')
+    p.add_argument('--read-batch-docs', type=int, default=64, help='Whole documents per threaded read task')
     p.add_argument('--resume', action='store_true')
     a = p.parse_args()
+    if a.out is None:
+        a.out = a.data
     prepare_document_shuffle(a)
 
 
@@ -879,12 +923,14 @@ def main():
     signal.signal(signal.SIGTERM, request_stop)
     try:
         folder = Path(args.data)
-        manifest = verify_data(folder)
+        manifest = verify_data(folder, shuffled=args.shuffled)
+        if not args.shuffled:
+            raise RuntimeError('This trainer requires --shuffled to select the fixed document/chunk ordering')
         # Rank zero generates the one-time chunk permutation BEFORE training.
         # A broadcast makes other ranks wait until all order files are complete.
         rank_zero_io(rank, lambda: ensure_chunk_order(folder, manifest, args.seed))
-        train = PackedSampler(folder, 'train', args.block_size, args.seed)
-        val = PackedSampler(folder, 'val', args.block_size, args.seed + 100)
+        train = PackedSampler(folder, 'train', args.block_size, args.seed, shuffled=True)
+        val = PackedSampler(folder, 'val', args.block_size, args.seed + 100, shuffled=True)
         try:
             capacity = math.ceil(train.n_blocks / (args.batch * args.accum))
             # Each *microbatch* must contain >=world chunks so all ranks
@@ -936,10 +982,10 @@ def main():
             signature['sampler_seed'] = args.seed
             signature['world_size'] = world
             signature['parallelism'] = 'ddp'
-            signature['manifest_sha256'] = file_sha(folder / 'manifest.json')
+            signature['manifest_sha256'] = file_sha(folder / 'manifest_shuffled.json')
             # Pin the actual 1-time shuffled chunk order in the checkpoint signature.
-            signature['chunk_order_sha256'] = file_sha(folder / 'train_chunk_order.u32') if rank == 0 else None
-            signature['chunk_inverse_sha256'] = file_sha(folder / 'train_chunk_inverse.u32') if rank == 0 else None
+            signature['chunk_order_sha256'] = file_sha(folder / 'train_chunk_order_shuffled.u32') if rank == 0 else None
+            signature['chunk_inverse_sha256'] = file_sha(folder / 'train_chunk_inverse_shuffled.u32') if rank == 0 else None
             signature['implementation_sha256'] = {name: file_sha(root / name)
                                                    for name in (Path(__file__).name, 'model.py', 'data.py', 'runtime.py')}
             signature['precision_dtype'] = str(amp_dtype)  # Stable across nodes; runtime details saved separately
