@@ -117,13 +117,14 @@ def inspect_training_checkpoint(ckpt, *, tokenizer_override=None):
         if sampler_order not in (SAMPLER_ORDER, LEGACY_FEISTEL_ORDER):
             raise ValueError(f'Unsupported prepared sampler: {sampler_order!r}')
         folder = Path(sig['data'])
-        manifest_file = folder / 'manifest.json'
+        shuffled = bool(sig.get('shuffled', False))
+        manifest_file = folder / ('manifest_shuffled.json' if shuffled else 'manifest.json')
         if not manifest_file.is_file():
             raise FileNotFoundError(manifest_file)
         digest = _sha256(manifest_file)
         if ckpt.get('manifest_sha256') != digest or sig.get('manifest_sha256') != digest:
             raise ValueError('Prepared checkpoint manifest checksum mismatch')
-        manifest = verify_data(folder)
+        manifest = verify_data(folder, shuffled=shuffled)
         n_blocks = int(manifest['train_blocks'])
         batch = int(sig['batch'])
         accum = int(sig['accum'])
@@ -135,13 +136,13 @@ def inspect_training_checkpoint(ckpt, *, tokenizer_override=None):
         if sampler_order == SAMPLER_ORDER:
             # Validate exactly the saved permutation used by the new training run.
             for filename, key in (
-                ('train_chunk_order.u32', 'chunk_order_sha256'),
-                ('train_chunk_inverse.u32', 'chunk_inverse_sha256'),
+                (('train_chunk_order_shuffled.u32' if shuffled else 'train_chunk_order.u32'), 'chunk_order_sha256'),
+                (('train_chunk_inverse_shuffled.u32' if shuffled else 'train_chunk_inverse.u32'), 'chunk_inverse_sha256'),
             ):
                 path = folder / filename
                 if not path.is_file() or _sha256(path) != sig.get(key):
                     raise ValueError(f'Chunk permutation missing or hash mismatch: {filename}')
-            order_info = json.loads((folder / 'train_chunk_order.json').read_text())
+            order_info = json.loads((folder / ('train_chunk_order_shuffled.json' if shuffled else 'train_chunk_order.json')).read_text())
             if (order_info.get('algorithm') != sampler_order or
                 int(order_info['n_blocks']) != n_blocks or
                 int(order_info['seed']) != int(sig['seed'])):
