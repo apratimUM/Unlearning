@@ -1,0 +1,14 @@
+# Python dependencies imported by the uploaded GPT-2/Pile pipeline.
+# Requires Python >=3.10. Install a CUDA-enabled torch build appropriate
+# to your cluster driver/GPU (see README) before installing this file.
+# Ranges are compatibility guidance, not a fully lockfile-tested environment.
+torch>=2.2,<3
+numpy>=1.24,<3
+transformers>=4.40,<5
+datasets>=2.19,<5
+huggingface-hub>=0.23,<2
+tokenizers>=0.15,<1
+tiktoken>=0.7,<1
+requests>=2.31,<3
+matplotlib>=3.7,<4
+tqdm>=4.66,<5
