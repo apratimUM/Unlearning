@@ -52,6 +52,7 @@ def parse_args():
     p.add_argument("--compile", action="store_true", help="Optional torch.compile; benchmark first")
     p.add_argument("--no-length-bucketing", action="store_true", help="Disable length-grouped batches for A/B speed comparison")
     p.add_argument("--prefetch-factor", type=int, default=4, help="Batches prefetched per dataloader worker")
+    p.add_argument("--export-validation-only", action="store_true", help="Export the same held-out Alpaca examples without training")
     p.add_argument("--chat", action="store_true", help="Run interactive generation from saved final model")
     return p.parse_args()
 
@@ -162,6 +163,8 @@ def main():
     model.config.use_cache = False
 
     raw = load_dataset("tatsu-lab/alpaca", split="train")
+    # Keep the original Hugging Face row number before selecting/splitting.
+    raw = raw.add_column("alpaca_row_id", list(range(len(raw))))
     if args.max_examples:
         raw = raw.shuffle(seed=42).select(range(min(args.max_examples, len(raw))))
     split = raw.train_test_split(test_size=args.eval_ratio, seed=42)
@@ -170,7 +173,8 @@ def main():
     def prepare(ds, name):
         mapped = ds.map(
             build_example, fn_kwargs={"tok": tokenizer, "max_length": args.max_length},
-            remove_columns=ds.column_names, num_proc=num_proc,
+            remove_columns=[c for c in ds.column_names if c != "alpaca_row_id"],
+            num_proc=num_proc,
             desc=f"Tokenizing {name}",
         )
         total = len(mapped)
@@ -182,6 +186,49 @@ def main():
 
     train_set = prepare(split["train"], "train")
     val_set = prepare(split["test"], "eval")
+
+    # Export the *actual* held-out examples after max-length/validity filtering.
+    # This does not change the 95/5 split, its seed, or the training data order.
+    kept_ids = set(val_set["alpaca_row_id"])
+    validation_rows = [r for r in split["test"] if r["alpaca_row_id"] in kept_ids]
+    assert len(validation_rows) == len(val_set)
+
+    validation_jsonl = args.out / "alpaca_validation.jsonl"
+    validation_txt = args.out / "alpaca_validation_questions.txt"
+    tmp_jsonl = validation_jsonl.with_suffix(".jsonl.tmp")
+    tmp_txt = validation_txt.with_suffix(".txt.tmp")
+    with tmp_jsonl.open("w", encoding="utf-8") as f_jsonl, \
+         tmp_txt.open("w", encoding="utf-8") as f_txt:
+        for i, r in enumerate(validation_rows, start=1):
+            instruction = (r["instruction"] or "").strip()
+            extra = (r["input"] or "").strip()
+            answer = (r["output"] or "").strip()
+            user_message = instruction + ("\n\n" + extra if extra else "")
+            prompt = f"{USER_TOKEN} {user_message}\n{ASSISTANT_TOKEN} "
+            record = {
+                "validation_index": i,
+                "alpaca_row_id": int(r["alpaca_row_id"]),
+                "instruction": instruction,
+                "input": extra,
+                "expected_output": answer,
+                "prompt": prompt,
+            }
+            f_jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f_txt.write(f"=== VALIDATION EXAMPLE {i} | original Alpaca row {r['alpaca_row_id']} ===\n")
+            f_txt.write(prompt + "\n")
+            f_txt.write("REFERENCE ANSWER (hidden from model at inference):\n")
+            f_txt.write(answer + "\n\n")
+    tmp_jsonl.replace(validation_jsonl)
+    tmp_txt.replace(validation_txt)
+    print(f"[VALIDATION EXPORT] {len(validation_rows):,} examples -> {validation_jsonl}", flush=True)
+    print(f"[VALIDATION EXPORT] readable questions/answers -> {validation_txt}", flush=True)
+
+    # The Trainer only receives the usual input_ids/labels/length columns.
+    train_set = train_set.remove_columns("alpaca_row_id")
+    val_set = val_set.remove_columns("alpaca_row_id")
+    if args.export_validation_only:
+        print("[DONE] Export completed; no training or checkpoints changed.", flush=True)
+        return
 
     # Verify exact assistant-only loss masking on a real data example.
     row = train_set[0]
