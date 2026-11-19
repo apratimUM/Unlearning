@@ -31,7 +31,7 @@ def verify_data(folder, shuffled=False):
         'vocab_size': VOCAB_SIZE, 'eos_token_id': EOS_ID,
         'chunking_method': 'standard_concatenate_then_split',
         'shuffling': False, 'terminal_padding': 0,
-        'incomplete_final_block': 'ignored',
+        'incomplete_final_block': 'eos_right_padded_targets_ignore_index_-100',
     }
     for key, value in expected.items():
         if m.get(key) != value:
@@ -47,8 +47,8 @@ def verify_data(folder, shuffled=False):
         path = folder / ('train_shuffled.bin' if shuffled and split == 'train' else f'{split}.bin')
         if not path.is_file() or path.stat().st_size != tokens * dtype.itemsize:
             raise ValueError(f'{split}: missing binary or incorrect size')
-        if tokens < BLOCK_SIZE + 1 or blocks != (tokens - 1) // BLOCK_SIZE:
-            raise ValueError(f'{split}: incorrect number of complete blocks')
+        if tokens < 2 or blocks != (tokens - 1 + BLOCK_SIZE - 1) // BLOCK_SIZE:
+            raise ValueError(f'{split}: incorrect number of blocks')
     db_name = 'documents_shuffled.sqlite' if shuffled else 'documents.sqlite'
     if not (folder / db_name).is_file():
         raise FileNotFoundError(folder / db_name)
@@ -133,7 +133,7 @@ class PackedSampler:
             self.folder / ('train_shuffled.bin' if self.shuffled and split == 'train' else f'{split}.bin'),
             dtype=np.dtype(m['token_dtype']), mode='r'
         )
-        self.n_blocks = (len(self.tokens) - 1) // self.block
+        self.n_blocks = (len(self.tokens) - 1 + self.block - 1) // self.block
         if self.n_blocks != int(m[f'{split}_blocks']):
             raise ValueError('Block count differs from manifest')
         self.permutation = None
@@ -181,10 +181,14 @@ class PackedSampler:
             raise IndexError(block_id)
         start = block_id * self.block
         seq = np.asarray(self.tokens[start:start + self.block + 1], dtype=np.int64)
-        x, y = seq[:-1].copy(), seq[1:].copy()
+        valid = len(seq) - 1
+        x = np.full(self.block, EOS_ID, dtype=np.int64)
+        y = np.full(self.block, -100, dtype=np.int64)
+        x[:valid] = seq[:valid]
+        y[:valid] = seq[1:]
         if x.shape != (BLOCK_SIZE,) or y.shape != (BLOCK_SIZE,):
             raise RuntimeError('Invalid block shape')
-        if not np.array_equal(x[1:], y[:-1]):
+        if not np.array_equal(x[1:valid], y[:valid-1]):
             raise RuntimeError('Next-token alignment mismatch')
         return x, y
 
@@ -201,16 +205,11 @@ class PackedSampler:
         ids = self.block_ids(first, count)
         if not ids:
             raise StopIteration('No complete blocks remain')
-        seqs = np.stack([
-            np.asarray(self.tokens[k*self.block:k*self.block+self.block+1], dtype=np.int64)
-            for k in ids
-        ])
-        t = torch.from_numpy(seqs)
-        x, y = t[:, :-1], t[:, 1:]
+        pairs = [self.get_block(k) for k in ids]
+        x = torch.from_numpy(np.stack([pair[0] for pair in pairs]))
+        y = torch.from_numpy(np.stack([pair[1] for pair in pairs]))
         if x.shape != (len(ids), BLOCK_SIZE) or y.shape != x.shape:
             raise RuntimeError('Invalid batch shape')
-        if not torch.equal(x[:, 1:], y[:, :-1]):
-            raise RuntimeError('Next-token alignment mismatch')
         return x, y
 
     def exposure_count(self, block_id, consumed_blocks):
