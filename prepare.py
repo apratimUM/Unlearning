@@ -153,10 +153,10 @@ def make_manifest(state, settings, engine):
                 full_documents=True, documents_seen=state['train_docs']+state['val_docs'],
                 train_docs=state['train_docs'], val_docs=state['val_docs'],
                 train_tokens=state['train_tokens'], val_tokens=state['val_tokens'],
-                train_blocks=max(0, (state['train_tokens']-1)//BLOCK),
-                val_blocks=max(0, (state['val_tokens']-1)//BLOCK),
+                train_blocks=max(0, (state['train_tokens']-1 + BLOCK-1)//BLOCK),
+                val_blocks=max(0, (state['val_tokens']-1 + BLOCK-1)//BLOCK),
                 input_tokens_per_block=BLOCK, target_tokens_per_block=BLOCK,
-                terminal_padding=0, incomplete_final_block='ignored',
+                terminal_padding=0, incomplete_final_block='eos_right_padded_targets_ignore_index_-100',
                 document_index='documents.sqlite',
                 stream_format='EOS-separated consecutive GPT-2 token IDs',
                 source_scan_complete=(settings['max_docs'] is None
@@ -593,20 +593,24 @@ def main():
                     for block in range(n):
                         start = block * BLOCK
                         seq = tokens[start:start+BLOCK+1]
-                        x, y = seq[:-1], seq[1:]
+                        valid = max(0, len(seq) - 1)
+                        x = np.full(BLOCK, EOS, dtype=np.int64)
+                        y = np.full(BLOCK, -100, dtype=np.int64)
+                        x[:valid] = seq[:valid]
+                        y[:valid] = seq[1:valid+1]
                         start = block * BLOCK
                         end = start + BLOCK
                         spans = db.execute('''SELECT source_row,token_offset,text_tokens,stored_tokens
                             FROM documents WHERE split=? AND token_offset<?
                             AND token_offset+stored_tokens>? ORDER BY token_offset''', (s, end, start))
                         previews.append(dict(block_id=block, stream_start=start,
-                             context_size=BLOCK, input_length=BLOCK, target_length=BLOCK,
+                             context_size=BLOCK, input_length=valid, target_length=valid,
                              source_documents=[dict(source_row=r, token_offset=off,
                                   text_tokens=nt, stored_tokens=ns)
                                   for r, off, nt, ns in spans],
-                             eos_positions=[i for i,v in enumerate(x) if v == EOS],
+                             eos_positions=[i for i,v in enumerate(x[:valid]) if v == EOS],
                              input_token_ids=x.tolist(), target_token_ids=y.tolist(),
-                             decoded_preview=hf.decode(x[:160].tolist()),
+                             decoded_preview=hf.decode(x[:min(160,valid)].tolist()),
                              next_token_alignment_correct=True))
                     atomic_json(out/(s+'_chunk_preview.json'),
                                 dict(method='standard_concatenate_then_split', context_size=BLOCK,
