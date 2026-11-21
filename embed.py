@@ -22,11 +22,10 @@ import math
 
 EXPECTED_SOURCE_DOCS = 134_318_121  # From Unlearning/prepare.py, deduplicated Pile rows
 
-# Restrict before importing any GPU framework, even in a fresh Python process.
-if os.environ.get('CUDA_VISIBLE_DEVICES', '0') != '0':
-    raise RuntimeError('Chennai policy: CUDA_VISIBLE_DEVICES must be exactly 0')
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-BASE = Path('/data/shreyasc/external/apratim')
+# Frances: each independent process receives exactly ONE physical GPU through
+# CUDA_VISIBLE_DEVICES from the Slurm launcher. CUDA maps it to local cuda:0.
+# No GPU selection is rewritten inside Python.
+BASE = Path(os.environ.get('PILE_EMBED_BASE', '/coe-aroyc/apratim'))
 os.environ.setdefault('HF_HOME', str(BASE / 'hf_cache'))
 os.environ.setdefault('HF_HUB_CACHE', str(BASE / 'hf_cache' / 'hub'))
 os.environ.setdefault('PIP_CACHE_DIR', str(BASE / 'pip_cache'))
@@ -55,7 +54,7 @@ METRICS = ('cosine',)
 def cli():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, default=BASE / 'pile_full_data')
-    p.add_argument('--out', type=Path, default=BASE / 'embedding_results' / 'bbc_pile_audit_v3')
+    p.add_argument('--out', type=Path, default=BASE / 'embedding_results' / 'bbc_pile_frances_4gpu' / 'standalone')
     p.add_argument('--models', nargs='+', choices=MODELS, default=list(MODELS))
     p.add_argument('--span-lengths', type=int, nargs='+', default=[32, 56, 128, 256, 512])
     p.add_argument('--spans-per-topic', type=int, default=5)
@@ -99,7 +98,7 @@ def cli():
     if a.data.resolve() == a.out.resolve() or a.out.resolve().is_relative_to(a.data.resolve()):
         p.error('Outputs must not be inside the dataset directory')
     if not a.out.resolve().is_relative_to(BASE):
-        p.error('Outputs must remain under Chennai /data/shreyasc/external/apratim')
+        p.error(f'Outputs must remain under Frances BASE: {BASE}')
     if a.self_test or a.inspect_data: return a
     if min(a.cache_workers, a.cache_decode_batch, a.cache_shard_chunks) < 1 or a.cache_build_limit < 0:
         p.error('Invalid cache settings')
@@ -341,7 +340,7 @@ class Encoder:
         self.limit = int(self.limit)
         self.dim = int(self.m.get_sentence_embedding_dimension())
         self.prompts = dict(getattr(self.m, 'prompts', {}) or {})
-        self.kwargs = set(self.m.get_model_kwargs() or [])
+        self.kwargs = set(self.m.get_model_kwargs() or []) if hasattr(self.m, 'get_model_kwargs') else set()
         self.revision = getattr(self.m, '_model_card_data', None)
 
     def plan(self, raw, query):
@@ -388,10 +387,22 @@ class Encoder:
         corpus batches, because that would tokenize them again.
         """
         texts, kw, label, _prefix = self.plan(raw, query)
-        features = self.tok(
-            texts, add_special_tokens=True, truncation=False,
-            padding=True, return_tensors='pt',
-        )
+        # Use the SAME model-specific tokenizer path as SentenceTransformer.encode().
+        # In particular, gte-Qwen2's module tokenization is not equivalent to
+        # calling its underlying Hugging Face tokenizer with default arguments.
+        # Temporarily disable the usual ST sequence-length truncation, then
+        # reject overlength inputs ourselves before running the model.
+        first = self.m._first_module()
+        original_max = getattr(first, 'max_seq_length', None)
+        if original_max is None:
+            raise RuntimeError(
+                f'{self.name}: cannot disable model-specific tokenizer truncation safely'
+            )
+        try:
+            first.max_seq_length = max(self.limit, 100000)
+            features = self.m.tokenize(texts)
+        finally:
+            first.max_seq_length = original_max
         if 'input_ids' not in features or 'attention_mask' not in features:
             raise RuntimeError(f'{self.name}: tokenizer did not return input IDs and attention mask')
         lengths = features['attention_mask'].sum(dim=1).tolist()
@@ -457,6 +468,39 @@ class Encoder:
             reference, _, _ = self.encode_prepared_reference(prepared, batch)
             max_err = float(np.max(np.abs(direct - reference)))
             if not np.allclose(direct, reference, atol=atol, rtol=atol):
+                if self.name == 'gte_qwen2':
+                    # Diagnostic only: compare the actual ST tokenization on these
+                    # startup probes. This never runs for real corpus batches.
+                    texts, _, _, _, direct_features = prepared
+                    official_features = self.m.tokenize(texts)
+                    for key in ('input_ids', 'attention_mask'):
+                        ours = direct_features.get(key)
+                        official = official_features.get(key)
+                        if ours is None or official is None:
+                            print(f'[DIAG] gte_qwen2 {key}: missing in one path', flush=True)
+                            continue
+                        same = (ours.shape == official.shape and
+                                torch.equal(ours.cpu(), official.cpu()))
+                        print(f'[DIAG] gte_qwen2 {key}: identical={same}; '
+                              f'direct_shape={tuple(ours.shape)}; '
+                              f'official_shape={tuple(official.shape)}', flush=True)
+                    d = direct / np.maximum(np.linalg.norm(direct, axis=1, keepdims=True), 1e-12)
+                    r = reference / np.maximum(np.linalg.norm(reference, axis=1, keepdims=True), 1e-12)
+                    cos = np.sum(d * r, axis=1)
+                    print(f'[DIAG] gte_qwen2 query={query}; precision={self.precision}; '
+                          f'max_abs_diff={max_err:.6g}; '
+                          f'per_example_cosine={cos.tolist()}', flush=True)
+                    # Check whether the discrepancy persists in FP32, without
+                    # changing the requested precision or accepting a mismatch.
+                    original_precision = self.precision
+                    try:
+                        self.precision = 'fp32'
+                        fp32_direct, _, _ = self.forward_prepared(prepared)
+                        fp32_reference, _, _ = self.encode_prepared_reference(prepared, batch)
+                    finally:
+                        self.precision = original_precision
+                    print(f'[DIAG] gte_qwen2 fp32_max_abs_diff='
+                          f'{float(np.max(np.abs(fp32_direct - fp32_reference))):.6g}', flush=True)
                 raise RuntimeError(
                     f'{self.name}: one-tokenization direct forward differs from '
                     f'SentenceTransformer.encode (max abs error={max_err:.6g}). '
@@ -801,7 +845,7 @@ def self_test():
             cache_dir = Path(td)
             cache_shard_chunks = 2
         args = _FakeArgs()
-        payload = ['alpha', 'naïve <|endoftext|>', 'third']
+        payload = ['alpha', 'naive <|endoftext|>', 'third']
         for j in (0, 1):
             start = j * 2
             stop = min(len(payload), start + 2)
@@ -1029,7 +1073,36 @@ class CacheReader:
         return self.data[start:end].decode('utf-8')
 
     def read_ids(self, chunk_ids):
-        return [self.read_id(x) for x in chunk_ids]
+        """Shard-grouped bulk mmap slicing. Preserve caller order and cache format.
+
+        In the full scan IDs are increasing, so one shard validation/open occurs
+        per 250k records, not once per record. Works across shard boundaries.
+        """
+        ids = np.asarray(chunk_ids, dtype=np.int64)
+        if ids.ndim != 1 or np.any(ids < 0) or np.any(ids >= self.total):
+            raise IndexError('Cache chunk ID outside source range')
+        if not len(ids):
+            return []
+        result = [None] * len(ids)
+        shards = ids // self.shard_chunks
+        # Consecutive runs also preserve order for unsorted pilot selections.
+        start = 0
+        while start < len(ids):
+            end = start + 1
+            while end < len(ids) and shards[end] == shards[start]:
+                end += 1
+            shard = int(shards[start])
+            self._switch(shard)
+            positions = ids[start:end] - shard * self.shard_chunks
+            offsets = np.asarray(self.index[positions], dtype=np.int64)
+            endings = np.asarray(self.index[positions + 1], dtype=np.int64)
+            if np.any(offsets < 0) or np.any(endings < offsets) or np.any(endings > len(self.data)):
+                raise RuntimeError(f'Corrupt decoded cache offsets for shard {shard}')
+            data = self.data
+            for i, (lo, hi) in enumerate(zip(offsets, endings), start):
+                result[i] = data[int(lo):int(hi)].decode('utf-8')
+            start = end
+        return result
 
 
 def cached_decoded_batches(reader, chunk_ids, begin, stop, batch_size, prefetch):
@@ -1084,6 +1157,44 @@ def cached_prepared_batches(reader, chunk_ids, encoder, begin, stop, batch_size,
             submit()
             yield value
 
+def cached_profiled_batches(reader, chunk_ids, encoder, begin, stop, batch_size, prefetch):
+    """Single producer + bounded overlap; metrics are producer CPU stage durations.
+
+    The model-specific tokenizer is used exactly once per corpus chunk.
+    A single producer protects custom tokenizer state while the GPU consumer
+    works on the preceding batch. Prefetch never grows with dataset length.
+    """
+    def prepare(offset):
+        end = min(stop, offset + batch_size)
+        ids = (np.fromiter(chunk_ids[offset:end], dtype=np.int64)
+               if isinstance(chunk_ids, range) else np.asarray(chunk_ids[offset:end], dtype=np.int64))
+        t0 = time.perf_counter()
+        texts = reader.read_ids(ids)
+        t1 = time.perf_counter()
+        prepared = encoder.prepare(texts, False)
+        t2 = time.perf_counter()
+        lengths = prepared[3]
+        return offset, end, ids, prepared, {'cache_s': t1 - t0,
+            'tokenize_s': t2 - t1, 'tokens': int(sum(lengths))}
+    if not prefetch:
+        for i in range(begin, stop, batch_size):
+            yield prepare(i)
+        return
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix='pile-tokenize-prefetch') as ex:
+        offsets = iter(range(begin, stop, batch_size))
+        pending = deque()
+        def submit():
+            i = next(offsets, None)
+            if i is not None:
+                pending.append(ex.submit(prepare, i))
+        for _ in range(prefetch):
+            submit()
+        while pending:
+            value = pending.popleft().result()
+            submit()
+            yield value
+
+
 def main():
     a=cli()
     if a.self_test:
@@ -1100,8 +1211,8 @@ def main():
     stop = GracefulStop()
     old_handlers = install_stop_handlers(stop)
     if not torch.cuda.is_available() or torch.cuda.device_count()!=1:
-        raise RuntimeError('Expected exactly one available CUDA GPU (physical GPU 0)')
-    print('[GPU] CUDA_VISIBLE_DEVICES=0, visible GPUs=1, name=',torch.cuda.get_device_name(0),flush=True)
+        raise RuntimeError('Expected one visible CUDA GPU per worker; set CUDA_VISIBLE_DEVICES in the launcher')
+    print(f'[GPU] CUDA_VISIBLE_DEVICES={os.environ.get("CUDA_VISIBLE_DEVICES","unset")}, visible GPUs=1, name={torch.cuda.get_device_name(0)}',flush=True)
     if not a.data.is_dir(): raise FileNotFoundError(a.data)
     mm, inv, perm, doc_order, total, manifest, orderinfo, ids=dataset(a.data)
     cache_reader = CacheReader(a, total)
